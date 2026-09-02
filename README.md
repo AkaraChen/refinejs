@@ -148,6 +148,10 @@ getters known only to the compiler are treated as effectful: heap facts,
 refinements of mutable bindings, and identities invalidated by reassignment are
 forgotten across that boundary.
 
+The complete implementation record, including the trust model, provenance
+rules, design choices, verification evidence, and known limits, is in
+[Compiler-backed platform refinements](docs/compiler-backed-platform-refinements.md).
+
 ## Static subset
 
 - `/*#rt */` comments attach to functions, parameters, and variables.
