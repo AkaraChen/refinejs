@@ -89,9 +89,64 @@ new token rather than by assuming hidden object mutation.
 ## CLI
 
 ```bash
-cargo run -- check fixtures/sqrt.js
-cargo run -- build fixtures/sqrt.js output.js
+cargo run -- check --target auto fixtures/sqrt.js
+cargo run -- build --target ecmascript fixtures/sqrt.js output.js
 ```
+
+`--target` selects the refinement-aware standard prelude. Accepted values are
+`auto`, `ecmascript`, `browser`, `node`, `deno`, and `bun`. `auto` uses
+syntax-aware imports and unbound runtime globals; select a target explicitly
+when a source file has no unique runtime marker or deliberately mixes
+compatibility APIs. The common ECMAScript catalog includes Array refinements,
+while the platform catalogs add DOM/Web APIs, Node modules and globals, Deno
+plus its Node compatibility surface, or Bun plus its Node compatibility
+surface.
+
+## Compiler-backed library types
+
+The curated prelude describes refinements and mutation/callback effects for
+APIs where those semantics matter. To type-check the rest of the APIs visible
+to a real TypeScript project—including unmodeled Array methods, DOM members,
+and Node/Deno/Bun declarations—run refinejs with an external
+[Corsa](https://github.com/ubugeeei-prod/corsa-bind) executable and the exact
+project config:
+
+```bash
+cargo run -- check \
+  --target browser \
+  --corsa /absolute/path/to/corsa \
+  --tsconfig /absolute/path/to/tsconfig.json \
+  /absolute/path/to/source.js
+```
+
+Both compiler flags are required. This crate pins the Corsa Rust binding to
+`1.12.4` but does not bundle the compiler executable; use a compatible Corsa
+build supplied by the caller. The source passed to refinejs must be the exact
+on-disk file included by the config.
+
+The `tsconfig` is authoritative for which declarations exist. For JavaScript,
+enable `allowJs`, `checkJs`, and strict checking. Choose `lib` entries such as
+`ES2025`, `DOM`, and `DOM.Iterable` for browser code, and make the appropriate
+Node, Deno, or Bun declarations resolvable through `types`, `typeRoots`, or the
+project file set. `--target` independently chooses refinejs's refinement/effect
+overlay; it does not add declarations to Corsa.
+
+Compiler errors from every file resolved by the project config gate refinement
+checking. To prevent suppressed compiler errors from becoming unsound fallback
+evidence, compiler-backed mode asks Corsa for the complete program file set and
+rejects TypeScript diagnostic-suppression directives in every implementation
+source, as well as configs which disable the required semantic/strict-null
+checks. Declaration files remain an explicit compiler trust root. Local
+callables need a `/*#rt */` contract; local member implementations cannot be
+used as compiler fallback evidence. Compiler-only call and member evidence is
+accepted only when Corsa resolves every symbol declaration to a declaration
+file; values containing local implementations, or mutable values that crossed
+an unknown execution boundary, cannot borrow that declaration's trust.
+Compiler-rendered project types do not acquire curated standard-library
+refinements merely because their printed names match catalog types. Calls and
+getters known only to the compiler are treated as effectful: heap facts,
+refinements of mutable bindings, and identities invalidated by reassignment are
+forgotten across that boundary.
 
 ## Static subset
 
@@ -104,8 +159,9 @@ cargo run -- build fixtures/sqrt.js output.js
   compound assignment, and division are rejected rather than approximated.
 - Runtime instrumentation uses source-fresh temporary identifiers; `__rt` is a
   reserved binding because emitted assertions call `__rt.assert`.
-- The prelude provides contracts for `Math.sqrt`, `Math.abs`,
-  `Array.isArray`, and `Number.isInteger`.
+- Target-specific prelude contracts cover the common ECMAScript collection
+  operations and selected browser, Node, Deno, and Bun APIs. Compiler-backed
+  mode fills ordinary type information outside that curated semantic overlay.
 
 ## Built with
 

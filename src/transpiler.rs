@@ -135,14 +135,17 @@ impl<'a> TranspilerVisitor<'a> {
         Expression::new_boolean_literal(SPAN, value, &self.builder)
     }
 
-    fn member_expr(&self, object: &str, property: &str) -> Expression<'a> {
-        let obj = self.ident(object);
+    fn member_expr_from_expression(&self, obj: Expression<'a>, property: &str) -> Expression<'a> {
         let property = self.alloc_str(property);
         let prop = IdentifierName::new(SPAN, property, &self.builder);
         Expression::new_static_member_expression(SPAN, obj, prop, false, &self.builder)
     }
 
-    fn predicate_to_expr(&self, pred: &PredicateExpr, self_name: &str) -> Expression<'a> {
+    fn member_expr(&self, object: &str, property: &str) -> Expression<'a> {
+        self.member_expr_from_expression(self.ident(object), property)
+    }
+
+    fn predicate_to_expr(&self, pred: &PredicateExpr) -> Expression<'a> {
         match pred {
             PredicateExpr::Literal(lit) => match lit {
                 Literal::Number(n) => self.numeric_literal(*n),
@@ -150,13 +153,16 @@ impl<'a> TranspilerVisitor<'a> {
                 Literal::Boolean(b) => self.boolean_literal(*b),
             },
             PredicateExpr::Identifier(name) => self.ident(name),
-            PredicateExpr::Member(obj, prop) => self.member_expr(obj, prop),
+            PredicateExpr::Member(object, property) => {
+                let object = self.predicate_to_expr(object);
+                self.member_expr_from_expression(object, property)
+            }
             // Predicate parameters are compile-time abstractions. Concrete
             // refinements at call sites are still checked statically.
             PredicateExpr::PredicateApply(_, _) => self.boolean_literal(true),
             PredicateExpr::Return => self.ident(&self.return_temp),
             PredicateExpr::Not(expr) => {
-                let arg = self.predicate_to_expr(expr, self_name);
+                let arg = self.predicate_to_expr(expr);
                 Expression::new_unary_expression(
                     SPAN,
                     UnaryOperator::LogicalNot,
@@ -169,8 +175,8 @@ impl<'a> TranspilerVisitor<'a> {
                     LogicalOp::And => LogicalOperator::And,
                     LogicalOp::Or => LogicalOperator::Or,
                 };
-                let left = self.predicate_to_expr(left, self_name);
-                let right = self.predicate_to_expr(right, self_name);
+                let left = self.predicate_to_expr(left);
+                let right = self.predicate_to_expr(right);
                 Expression::new_logical_expression(SPAN, left, op, right, &self.builder)
             }
             PredicateExpr::Binary(op, left, right) => {
@@ -188,8 +194,8 @@ impl<'a> TranspilerVisitor<'a> {
                     BinaryOp::Mul => BinaryOperator::Multiplication,
                     BinaryOp::Div => BinaryOperator::Division,
                 };
-                let left = self.predicate_to_expr(left, self_name);
-                let right = self.predicate_to_expr(right, self_name);
+                let left = self.predicate_to_expr(left);
+                let right = self.predicate_to_expr(right);
                 Expression::new_binary_expression(SPAN, left, op, right, &self.builder)
             }
         }
@@ -203,7 +209,9 @@ impl<'a> TranspilerVisitor<'a> {
                 Literal::Boolean(b) => b.to_string(),
             },
             PredicateExpr::Identifier(name) => name.clone(),
-            PredicateExpr::Member(obj, prop) => format!("{}.{}", obj, prop),
+            PredicateExpr::Member(object, property) => {
+                format!("{}.{}", self.predicate_to_string(object), property)
+            }
             PredicateExpr::PredicateApply(name, expr) => {
                 format!("{}({})", name, self.predicate_to_string(expr))
             }
@@ -255,7 +263,7 @@ impl<'a> TranspilerVisitor<'a> {
     ) -> Expression<'a> {
         let ctx_key = self.alloc_str(ctx_key);
         let callee = self.member_expr(RUNTIME_IDENT, "assert");
-        let cond = self.predicate_to_expr(predicate, ctx_value_name);
+        let cond = self.predicate_to_expr(predicate);
         let msg = self.string_literal(message);
 
         let ctx_key_ident =
@@ -344,14 +352,11 @@ impl<'a> TranspilerVisitor<'a> {
             if let AnnotationTarget::Param {
                 param_name, index, ..
             } = &a.target
+                && let Some(pred) = &a.ty.predicate
+                && let Some(param) = func.params.items.get(*index)
+                && Self::param_name(param).as_deref() == Some(param_name)
             {
-                if let Some(pred) = &a.ty.predicate {
-                    if let Some(param) = func.params.items.get(*index) {
-                        if Self::param_name(param).as_deref() == Some(param_name) {
-                            asserts.push(self.build_param_assert(&name, param_name, pred));
-                        }
-                    }
-                }
+                asserts.push(self.build_param_assert(&name, param_name, pred));
             }
         }
         asserts
@@ -483,13 +488,13 @@ impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
             self.current_function.push(key.clone());
 
             let asserts = self.process_function_body(func);
-            if !asserts.is_empty() {
-                if let Some(body) = &mut func.body {
-                    let mut new_statements = ArenaVec::new_in(&self.builder);
-                    new_statements.extend(asserts);
-                    new_statements.extend(body.statements.drain(..));
-                    body.statements = new_statements;
-                }
+            if !asserts.is_empty()
+                && let Some(body) = &mut func.body
+            {
+                let mut new_statements = ArenaVec::new_in(&self.builder);
+                new_statements.extend(asserts);
+                new_statements.extend(body.statements.drain(..));
+                body.statements = new_statements;
             }
         }
 
@@ -573,13 +578,9 @@ fn rename_identifier(pred: &PredicateExpr, from: &str, to: &str) -> PredicateExp
         } else {
             name.clone()
         }),
-        PredicateExpr::Member(obj, prop) => PredicateExpr::Member(
-            if obj == from {
-                to.to_string()
-            } else {
-                obj.clone()
-            },
-            prop.clone(),
+        PredicateExpr::Member(object, property) => PredicateExpr::Member(
+            Box::new(rename_identifier(object, from, to)),
+            property.clone(),
         ),
         PredicateExpr::PredicateApply(name, expr) => {
             PredicateExpr::PredicateApply(name.clone(), Box::new(rename_identifier(expr, from, to)))

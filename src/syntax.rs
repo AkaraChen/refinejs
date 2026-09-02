@@ -9,6 +9,8 @@ pub struct SourceLocation {
 pub enum BaseType {
     Primitive(String),
     Array(Box<BaseType>),
+    Generic(String, Vec<BaseType>),
+    Union(Vec<BaseType>),
     Object(Vec<(String, BaseType)>),
     Function(Vec<RefinedParam>, Box<RefinementType>),
     Named(String),
@@ -32,7 +34,7 @@ pub enum PredicateExpr {
     Logical(LogicalOp, Box<PredicateExpr>, Box<PredicateExpr>),
     Not(Box<PredicateExpr>),
     Identifier(String),
-    Member(String, String),
+    Member(Box<PredicateExpr>, String),
     PredicateApply(String, Box<PredicateExpr>),
     Literal(Literal),
     Return,

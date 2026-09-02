@@ -62,9 +62,7 @@ impl<'a> Lexer<'a> {
             if ch.is_whitespace() {
                 self.pos += ch.len_utf8();
             } else if ch == '/' && self.src[self.pos + 1..].starts_with('/') {
-                while self.pos < self.src.len()
-                    && self.src[self.pos..].chars().next().unwrap() != '\n'
-                {
+                while self.pos < self.src.len() && !self.src[self.pos..].starts_with('\n') {
                     self.pos += 1;
                 }
             } else {
@@ -388,6 +386,18 @@ impl TypeParser {
                         self.expect_op(">")?;
                         Ok(BaseType::Array(Box::new(el)))
                     }
+                    _ if self.peek_op() == Some("<") => {
+                        self.pos += 1;
+                        let mut arguments = Vec::new();
+                        loop {
+                            arguments.push(self.parse_base_type()?);
+                            if !self.eat(TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect_op(">")?;
+                        Ok(BaseType::Generic(name, arguments))
+                    }
                     _ => Ok(BaseType::Named(name)),
                 }
             }
@@ -496,16 +506,16 @@ impl TypeParser {
     }
 
     fn parse_unary(&mut self) -> Result<PredicateExpr, String> {
-        if let Some(op) = self.peek_additive_op() {
-            if op == BinaryOp::Add || op == BinaryOp::Sub {
-                self.pos += 1;
-                let expr = self.parse_unary()?;
-                return Ok(PredicateExpr::Binary(
-                    op,
-                    Box::new(PredicateExpr::Literal(Literal::Number(0.0))),
-                    Box::new(expr),
-                ));
-            }
+        if let Some(op) = self.peek_additive_op()
+            && (op == BinaryOp::Add || op == BinaryOp::Sub)
+        {
+            self.pos += 1;
+            let expr = self.parse_unary()?;
+            return Ok(PredicateExpr::Binary(
+                op,
+                Box::new(PredicateExpr::Literal(Literal::Number(0.0))),
+                Box::new(expr),
+            ));
         }
         self.parse_primary()
     }
@@ -533,25 +543,27 @@ impl TypeParser {
             }
             TokenKind::Ident => {
                 self.pos += 1;
-                match tok.value.as_str() {
-                    "true" => Ok(PredicateExpr::Literal(Literal::Boolean(true))),
-                    "false" => Ok(PredicateExpr::Literal(Literal::Boolean(false))),
-                    "$" => Ok(PredicateExpr::Return),
+                let mut expression = match tok.value.as_str() {
+                    "true" => PredicateExpr::Literal(Literal::Boolean(true)),
+                    "false" => PredicateExpr::Literal(Literal::Boolean(false)),
+                    "$" => PredicateExpr::Return,
                     _ => {
                         if self.peek().kind == TokenKind::LParen {
                             self.pos += 1;
                             let arg = self.parse_predicate()?;
                             self.expect(TokenKind::RParen)?;
-                            Ok(PredicateExpr::PredicateApply(tok.value, Box::new(arg)))
-                        } else if self.peek().kind == TokenKind::Dot {
-                            self.pos += 1;
-                            let prop = self.expect_ident_raw()?;
-                            Ok(PredicateExpr::Member(tok.value, prop))
+                            PredicateExpr::PredicateApply(tok.value, Box::new(arg))
                         } else {
-                            Ok(PredicateExpr::Identifier(tok.value))
+                            PredicateExpr::Identifier(tok.value)
                         }
                     }
+                };
+                while self.peek().kind == TokenKind::Dot {
+                    self.pos += 1;
+                    let property = self.expect_ident_raw()?;
+                    expression = PredicateExpr::Member(Box::new(expression), property);
                 }
+                Ok(expression)
             }
             _ => Err(format!("Unexpected token '{}' in predicate", tok.value)),
         }
@@ -737,7 +749,7 @@ pub fn parse_file(source: &str, file_name: &str) -> Result<ParseResult, String> 
         if comment.position != CommentPosition::Leading {
             continue;
         }
-        let payload = match extract_rt_payload(&comment.span.source_text(source)) {
+        let payload = match extract_rt_payload(comment.span.source_text(source)) {
             Some(p) => p,
             None => continue,
         };
@@ -746,10 +758,10 @@ pub fn parse_file(source: &str, file_name: &str) -> Result<ParseResult, String> 
         let comment_end = comment.span.end;
         let mut best: Option<&SpanInfo> = None;
         for info in &collector.spans {
-            if info.span.start >= comment_end {
-                if best.map(|b| info.span.start < b.span.start).unwrap_or(true) {
-                    best = Some(info);
-                }
+            if info.span.start >= comment_end
+                && best.map(|b| info.span.start < b.span.start).unwrap_or(true)
+            {
+                best = Some(info);
             }
         }
 

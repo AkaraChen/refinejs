@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+corsa = "=1.12.4"
 oxc_allocator = "0.148.0"
 oxc_ast = "0.148.0"
 oxc_ast_visit = "0.148.0"
@@ -12,4 +13,7 @@ oxc_parser = "0.148.0"
 oxc_span = "0.148.0"
 oxc_semantic = "0.148.0"
 oxc_syntax = "0.148.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
 z3 = "0.19.2"

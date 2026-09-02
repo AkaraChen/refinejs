@@ -16,7 +16,11 @@ const x = 9;
 fn parser_finds_annotations() {
     let result = parser::parse_file(SQRT_SOURCE, "test.js").unwrap();
     assert!(result.annotations.len() >= 3);
-    let params: Vec<_> = result.annotations.iter().filter(|a| matches!(a.target, syntax::AnnotationTarget::Param { .. })).collect();
+    let params: Vec<_> = result
+        .annotations
+        .iter()
+        .filter(|a| matches!(a.target, syntax::AnnotationTarget::Param { .. }))
+        .collect();
     assert!(!params.is_empty());
 }
 
