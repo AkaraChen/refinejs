@@ -189,6 +189,11 @@ pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
             errors.push(err);
         }
 
+        if let Some(index) = &a.ty.index
+            && let Some(err) = check_predicate(index, &allowed, is_return, a.loc.clone())
+        {
+            errors.push(err);
+        }
         if let Some(pred) = &a.ty.predicate
             && let Some(err) = check_predicate(pred, &allowed, is_return, a.loc.clone())
         {
@@ -201,22 +206,12 @@ pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
 
 fn check_type(ty: &RefinementType, loc: SourceLocation) -> Option<RtError> {
     match &ty.base {
-        BaseType::Array(el) => check_type(
-            &RefinementType {
-                base: (**el).clone(),
-                predicate: None,
-            },
-            loc,
-        ),
+        BaseType::Array(el) => check_type(&RefinementType::from_base((**el).clone()), loc),
         BaseType::Generic(_, arguments) | BaseType::Union(arguments) => {
             for argument in arguments {
-                if let Some(err) = check_type(
-                    &RefinementType {
-                        base: argument.clone(),
-                        predicate: None,
-                    },
-                    loc.clone(),
-                ) {
+                if let Some(err) =
+                    check_type(&RefinementType::from_base(argument.clone()), loc.clone())
+                {
                     return Some(err);
                 }
             }
@@ -224,13 +219,7 @@ fn check_type(ty: &RefinementType, loc: SourceLocation) -> Option<RtError> {
         }
         BaseType::Object(fields) => {
             for (_, t) in fields {
-                if let Some(err) = check_type(
-                    &RefinementType {
-                        base: t.clone(),
-                        predicate: None,
-                    },
-                    loc.clone(),
-                ) {
+                if let Some(err) = check_type(&RefinementType::from_base(t.clone()), loc.clone()) {
                     return Some(err);
                 }
             }

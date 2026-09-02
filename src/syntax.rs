@@ -25,7 +25,41 @@ pub struct RefinedParam {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefinementType {
     pub base: BaseType,
+    /// Flux-style index: `number[10]`, `boolean[0 < n]`, `DenseArray<T>[n]`.
+    /// For primitives the value equals the index; for dense arrays the length
+    /// equals the index. Logical integer arithmetic, not IEEE-754.
+    pub index: Option<PredicateExpr>,
     pub predicate: Option<PredicateExpr>,
+}
+
+impl RefinementType {
+    pub fn from_base(base: BaseType) -> Self {
+        Self {
+            base,
+            index: None,
+            predicate: None,
+        }
+    }
+
+    pub fn runtime_checks(&self) -> Vec<PredicateExpr> {
+        let mut checks = Vec::new();
+        if let Some(index) = &self.index {
+            let left = if matches!(&self.base, BaseType::Generic(name, _) if name == "DenseArray") {
+                PredicateExpr::Member(Box::new(PredicateExpr::Return), "length".into())
+            } else {
+                PredicateExpr::Return
+            };
+            checks.push(PredicateExpr::Binary(
+                BinaryOp::EqEqEq,
+                Box::new(left),
+                Box::new(index.clone()),
+            ));
+        }
+        if let Some(predicate) = &self.predicate {
+            checks.push(predicate.clone());
+        }
+        checks
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +74,7 @@ pub enum PredicateExpr {
     Return,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     EqEqEq,
     NotEqEq,
@@ -56,7 +90,7 @@ pub enum BinaryOp {
     Div,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalOp {
     And,
     Or,

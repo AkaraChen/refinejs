@@ -352,25 +352,25 @@ impl<'a> TranspilerVisitor<'a> {
             if let AnnotationTarget::Param {
                 param_name, index, ..
             } = &a.target
-                && let Some(pred) = &a.ty.predicate
                 && let Some(param) = func.params.items.get(*index)
                 && Self::param_name(param).as_deref() == Some(param_name)
             {
-                asserts.push(self.build_param_assert(&name, param_name, pred));
+                for pred in a.ty.runtime_checks() {
+                    let pred = rewrite_return(&pred, param_name);
+                    asserts.push(self.build_param_assert(&name, param_name, &pred));
+                }
             }
         }
         asserts
     }
 
-    fn return_predicates(&self, function: &(String, u32)) -> Vec<&'a PredicateExpr> {
+    fn return_predicates(&self, function: &(String, u32)) -> Vec<PredicateExpr> {
         self.by_function
             .get(function)
             .map(|anns| {
                 anns.iter()
-                    .filter_map(|a| match &a.target {
-                        AnnotationTarget::Return { .. } => a.ty.predicate.as_ref(),
-                        _ => None,
-                    })
+                    .filter(|a| matches!(a.target, AnnotationTarget::Return { .. }))
+                    .flat_map(|a| a.ty.runtime_checks())
                     .collect()
             })
             .unwrap_or_default()
@@ -379,7 +379,7 @@ impl<'a> TranspilerVisitor<'a> {
     fn build_return_iife(
         &self,
         function_name: &str,
-        predicates: Vec<&PredicateExpr>,
+        predicates: Vec<PredicateExpr>,
         arg: Expression<'a>,
     ) -> Expression<'a> {
         // const __rt_return = arg;
@@ -398,7 +398,7 @@ impl<'a> TranspilerVisitor<'a> {
             false,
             &self.builder,
         ));
-        for pred in predicates {
+        for pred in &predicates {
             stmts.push(self.build_return_assert(function_name, pred));
         }
         stmts.push(Statement::new_return_statement(
@@ -534,8 +534,13 @@ impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
                 Some(a) => a.clone(),
                 None => continue,
             };
-            let predicate = anns.iter().find_map(|a| a.ty.predicate.as_ref());
-            let Some(predicate) = predicate else { continue };
+            let checks = anns
+                .iter()
+                .flat_map(|a| a.ty.runtime_checks())
+                .collect::<Vec<_>>();
+            let Some(predicate) = checks.first() else {
+                continue;
+            };
             let Some(init) = d.init.take() else { continue };
 
             d.init = Some(self.build_iife_for_variable(&name, predicate, init));
@@ -571,6 +576,31 @@ fn fresh_generated_identifier(
     candidate
 }
 
+fn rewrite_return(pred: &PredicateExpr, name: &str) -> PredicateExpr {
+    match pred {
+        PredicateExpr::Return => PredicateExpr::Identifier(name.to_string()),
+        PredicateExpr::Member(object, property) => {
+            PredicateExpr::Member(Box::new(rewrite_return(object, name)), property.clone())
+        }
+        PredicateExpr::Not(inner) => PredicateExpr::Not(Box::new(rewrite_return(inner, name))),
+        PredicateExpr::PredicateApply(pred_name, argument) => PredicateExpr::PredicateApply(
+            pred_name.clone(),
+            Box::new(rewrite_return(argument, name)),
+        ),
+        PredicateExpr::Binary(op, left, right) => PredicateExpr::Binary(
+            *op,
+            Box::new(rewrite_return(left, name)),
+            Box::new(rewrite_return(right, name)),
+        ),
+        PredicateExpr::Logical(op, left, right) => PredicateExpr::Logical(
+            *op,
+            Box::new(rewrite_return(left, name)),
+            Box::new(rewrite_return(right, name)),
+        ),
+        PredicateExpr::Identifier(_) | PredicateExpr::Literal(_) => pred.clone(),
+    }
+}
+
 fn rename_identifier(pred: &PredicateExpr, from: &str, to: &str) -> PredicateExpr {
     match pred {
         PredicateExpr::Identifier(name) => PredicateExpr::Identifier(if name == from {
@@ -587,12 +617,12 @@ fn rename_identifier(pred: &PredicateExpr, from: &str, to: &str) -> PredicateExp
         }
         PredicateExpr::Not(expr) => PredicateExpr::Not(Box::new(rename_identifier(expr, from, to))),
         PredicateExpr::Logical(op, left, right) => PredicateExpr::Logical(
-            op.clone(),
+            *op,
             Box::new(rename_identifier(left, from, to)),
             Box::new(rename_identifier(right, from, to)),
         ),
         PredicateExpr::Binary(op, left, right) => PredicateExpr::Binary(
-            op.clone(),
+            *op,
             Box::new(rename_identifier(left, from, to)),
             Box::new(rename_identifier(right, from, to)),
         ),

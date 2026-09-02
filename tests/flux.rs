@@ -140,6 +140,69 @@ fn soundness_regressions_have_definite_diagnostics() {
         ("flux_tdz_negative.js", "before its declaration"),
         ("flux_console_spread_negative.js", "Spread arguments"),
         ("flux_prelude_shadow_negative.js", "reserved"),
+        (
+            "flux_index_singleton_negative.js",
+            "does not match its index",
+        ),
+        ("flux_index_param_negative.js", "does not match its index"),
+        (
+            "flux_dense_oob_negative.js",
+            "outside the collection bounds",
+        ),
+        ("flux_dense_empty_pop_negative.js", "non-empty dense array"),
+        (
+            "flux_loop_factorial_negative.js",
+            "does not satisfy its refinement",
+        ),
+        (
+            "flux_loop_dense_index_negative.js",
+            "outside the collection bounds",
+        ),
+        (
+            "flux_loop_dense_empty_pop_negative.js",
+            "non-empty dense array",
+        ),
+        (
+            "flux_nan_alias_negative.js",
+            "does not satisfy its refinement",
+        ),
+        ("flux_assert_index_negative.js", "does not match its index"),
+        (
+            "flux_inc_dec_negative.js",
+            "does not satisfy its refinement",
+        ),
+        ("flux_rvec_oob_negative.js", "outside the collection bounds"),
+        (
+            "flux_rvec_push_get_negative.js",
+            "outside the collection bounds",
+        ),
+        (
+            "flux_fib_loop_negative.js",
+            "does not satisfy its refinement",
+        ),
+        ("flux_loop01_negative.js", "does not satisfy its refinement"),
+        ("flux_countdown_negative.js", "does not match its index"),
+        ("flux_scrape_range_negative.js", "does not match its index"),
+        ("flux_min_negative.js", "does not satisfy its refinement"),
+        ("flux_logical_not_negative.js", "does not match its index"),
+        (
+            "flux_unary_neg_negative.js",
+            "does not satisfy its refinement",
+        ),
+        ("flux_neq_negative.js", "does not satisfy its refinement"),
+        (
+            "flux_not_pred_negative.js",
+            "does not satisfy its refinement",
+        ),
+        (
+            "flux_bool_not_index_negative.js",
+            "does not match its index",
+        ),
+        (
+            "flux_min_index_negative.js",
+            "does not satisfy its refinement",
+        ),
+        ("flux_dense_param_negative.js", "does not match its index"),
     ];
 
     for (fixture, expected) in cases {
@@ -152,6 +215,43 @@ fn soundness_regressions_have_definite_diagnostics() {
             "expected {file_name} to report {expected:?}, got {errors:#?}"
         );
     }
+}
+
+#[test]
+fn flux_rs_triage_lists_deferred_neg_surface_twins() {
+    let text = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/flux-rs-test-triage.md"),
+    )
+    .expect("failed to read flux-rs triage note");
+    for name in [
+        "bin_rels.rs",
+        "binop.rs",
+        "bsearch.rs",
+        "const00.rs",
+        "const01.rs",
+        "const02.rs",
+        "constr00.rs",
+        "division.rs",
+        "float02.rs",
+        "join00.rs",
+        "join01.rs",
+        "join03.rs",
+        "join04.rs",
+        "operators.rs",
+        "range.rs",
+        "read_loop.rs",
+        "read_ref.rs",
+        "remainder.rs",
+        "test01.rs",
+        "test03.rs",
+    ] {
+        let needle = format!("tests/tests/neg/surface/{name}");
+        assert!(text.contains(&needle), "triage note is missing {needle}");
+    }
+    assert!(
+        !text.contains("## Deferred portable"),
+        "triage note still has a Deferred portable table"
+    );
 }
 
 #[test]

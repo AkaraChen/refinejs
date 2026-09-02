@@ -66,6 +66,7 @@ fn add_ecmascript(registry: &mut LibraryRegistry) {
 
     let x_non_nan = RefinementType {
         base: primitive("number"),
+        index: None,
         predicate: Some(PredicateExpr::Binary(
             BinaryOp::EqEqEq,
             Box::new(PredicateExpr::Identifier("x".into())),
@@ -420,6 +421,33 @@ fn add_array_methods(registry: &mut LibraryRegistry) {
             .with_type_parameters(&["$T"])
             .with_receiver(receiver)
             .with_effects(receiver_effects(ReceiverEffect::Mutate)),
+    );
+    registry.add_receiver_method(
+        "DenseArray",
+        "pop",
+        FunctionSignature::new(Vec::new(), type_variable_type("$T"))
+            .with_type_parameters(&["$T"])
+            .with_receiver(generic_type("DenseArray", vec![type_variable("$T")]))
+            .with_effects(receiver_effects(ReceiverEffect::Mutate))
+            .with_refinements(vec![
+                SemanticRefinement::RequiresPositiveReceiverLength,
+                SemanticRefinement::ReceiverLengthDecreasesByOne,
+            ]),
+    );
+    registry.add_receiver_method(
+        "DenseArray",
+        "push",
+        FunctionSignature::new(
+            vec![LibraryParameter::rest("items", type_variable_type("$T"))],
+            non_negative_number(),
+        )
+        .with_type_parameters(&["$T"])
+        .with_receiver(generic_type("DenseArray", vec![type_variable("$T")]))
+        .with_effects(receiver_effects(ReceiverEffect::Mutate))
+        .with_refinements(vec![
+            SemanticRefinement::ReceiverLengthIncreasesByArgumentCount,
+            SemanticRefinement::ReceiverMayContainArguments,
+        ]),
     );
 }
 
@@ -1171,6 +1199,7 @@ fn type_variable(name: &str) -> BaseType {
 fn primitive_type(name: &str) -> RefinementType {
     RefinementType {
         base: primitive(name),
+        index: None,
         predicate: None,
     }
 }
@@ -1178,6 +1207,7 @@ fn primitive_type(name: &str) -> RefinementType {
 fn named_type(name: &str) -> RefinementType {
     RefinementType {
         base: named(name),
+        index: None,
         predicate: None,
     }
 }
@@ -1185,6 +1215,7 @@ fn named_type(name: &str) -> RefinementType {
 fn type_variable_type(name: &str) -> RefinementType {
     RefinementType {
         base: type_variable(name),
+        index: None,
         predicate: None,
     }
 }
@@ -1192,6 +1223,7 @@ fn type_variable_type(name: &str) -> RefinementType {
 fn array_type(element: BaseType) -> RefinementType {
     RefinementType {
         base: BaseType::Array(Box::new(element)),
+        index: None,
         predicate: None,
     }
 }
@@ -1199,6 +1231,7 @@ fn array_type(element: BaseType) -> RefinementType {
 fn generic_type(name: &str, arguments: Vec<BaseType>) -> RefinementType {
     RefinementType {
         base: BaseType::Generic(name.to_string(), arguments),
+        index: None,
         predicate: None,
     }
 }
@@ -1206,6 +1239,7 @@ fn generic_type(name: &str, arguments: Vec<BaseType>) -> RefinementType {
 fn union_type(members: Vec<BaseType>) -> RefinementType {
     RefinementType {
         base: BaseType::Union(members),
+        index: None,
         predicate: None,
     }
 }
@@ -1241,17 +1275,12 @@ fn callback_type(params: Vec<(&str, BaseType)>, returns: BaseType) -> Refinement
                 .into_iter()
                 .map(|(name, base)| RefinedParam {
                     name: name.to_string(),
-                    ty: RefinementType {
-                        base,
-                        predicate: None,
-                    },
+                    ty: RefinementType::from_base(base),
                 })
                 .collect(),
-            Box::new(RefinementType {
-                base: returns,
-                predicate: None,
-            }),
+            Box::new(RefinementType::from_base(returns)),
         ),
+        index: None,
         predicate: None,
     }
 }
@@ -1259,6 +1288,7 @@ fn callback_type(params: Vec<(&str, BaseType)>, returns: BaseType) -> Refinement
 fn number_parameter_at_least(name: &str, minimum: i64) -> RefinementType {
     RefinementType {
         base: primitive("number"),
+        index: None,
         predicate: Some(PredicateExpr::Binary(
             BinaryOp::Gte,
             Box::new(PredicateExpr::Identifier(name.to_string())),
@@ -1270,6 +1300,7 @@ fn number_parameter_at_least(name: &str, minimum: i64) -> RefinementType {
 fn non_negative_number() -> RefinementType {
     RefinementType {
         base: primitive("number"),
+        index: None,
         predicate: Some(PredicateExpr::Binary(
             BinaryOp::Gte,
             Box::new(PredicateExpr::Return),
@@ -1281,6 +1312,7 @@ fn non_negative_number() -> RefinementType {
 fn sqrt_result() -> RefinementType {
     RefinementType {
         base: primitive("number"),
+        index: None,
         predicate: Some(PredicateExpr::Logical(
             LogicalOp::And,
             Box::new(PredicateExpr::Binary(

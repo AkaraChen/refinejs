@@ -15,17 +15,20 @@ use oxc_ast::ast::{
 use oxc_ast_visit::{Visit, walk::walk_expression};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator};
+use oxc_syntax::operator::{
+    AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
+};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use z3::{
     Fixedpoint, FuncDecl, SatResult, Solver, Sort as Z3Sort, Symbol,
-    ast::{self, Ast, Bool, Dynamic, Float, RoundingMode, String as Z3String},
+    ast::{self, Ast, Bool, Dynamic, Float, Int as Z3Int, RoundingMode, String as Z3String},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Sort {
     Number,
+    Int,
     Bool,
     String,
     Ref,
@@ -34,12 +37,14 @@ enum Sort {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Term {
     Number(i64),
+    Int(i64),
     Bool(bool),
     String(String),
     Var(String, Sort),
     Member(Box<Term>, String, Sort),
     Index(Box<Term>, Box<Term>, Sort),
     Pred(String, Box<Term>),
+    ToNumber(Box<Term>),
     Add(Box<Term>, Box<Term>),
     Sub(Box<Term>, Box<Term>),
     Mul(Box<Term>, Box<Term>),
@@ -58,7 +63,15 @@ enum Term {
 impl Term {
     fn sort(&self) -> Sort {
         match self {
-            Self::Number(_) | Self::Add(..) | Self::Sub(..) | Self::Mul(..) => Sort::Number,
+            Self::Number(_) | Self::ToNumber(_) => Sort::Number,
+            Self::Int(_) => Sort::Int,
+            Self::Add(left, right) | Self::Sub(left, right) | Self::Mul(left, right) => {
+                if left.sort() == Sort::Int && right.sort() == Sort::Int {
+                    Sort::Int
+                } else {
+                    Sort::Number
+                }
+            }
             Self::String(_) => Sort::String,
             Self::Bool(_)
             | Self::Eq(..)
@@ -1061,8 +1074,16 @@ impl Verifier<'_> {
             }
         }
 
+        let index_names = index_names_in_contract(&contract);
         for (param_name, ty) in &contract.params {
-            let term = Term::Var(format!("{name}.{param_name}"), sort_for_base(&ty.base));
+            let sort = if index_names.contains(param_name)
+                && matches!(&ty.base, BaseType::Primitive(kind) if kind == "number")
+            {
+                Sort::Int
+            } else {
+                sort_for_base(&ty.base)
+            };
+            let term = Term::Var(format!("{name}.{param_name}"), sort);
             replacements.insert(param_name.clone(), term.clone());
             state.entry_params.insert(param_name.clone(), term.clone());
             state.env.insert(
@@ -1093,6 +1114,27 @@ impl Verifier<'_> {
             return;
         }
         for (param_name, ty) in &contract.params {
+            if let (Some(index), Some(value)) = (&ty.index, state.env.get(param_name).cloned()) {
+                match predicate_term(index, &replacements, &HashMap::new(), Some(Sort::Int)) {
+                    Ok(index_term) => {
+                        let formula = index_formula(&value, &index_term);
+                        state.assumptions.push(formula.clone());
+                        if let Some(binding) = state.env.get_mut(param_name) {
+                            let formula = match binding.qualifier.take() {
+                                Some(previous) => {
+                                    Term::And(Box::new(previous.formula), Box::new(formula))
+                                }
+                                None => formula,
+                            };
+                            binding.qualifier = Some(Qualifier {
+                                value: binding.term.clone(),
+                                formula,
+                            });
+                        }
+                    }
+                    Err(message) => self.error(message, function.span),
+                }
+            }
             if let Some(predicate) = &ty.predicate {
                 match predicate_term(predicate, &replacements, &HashMap::new(), None) {
                     Ok(formula) => {
@@ -1125,6 +1167,141 @@ impl Verifier<'_> {
         }
     }
 
+    fn verify_variable_declaration(
+        &mut self,
+        declaration: &oxc_ast::ast::VariableDeclaration<'_>,
+        states: Vec<State>,
+        current_function: Option<(&str, &Contract)>,
+    ) -> Vec<State> {
+        for declarator in &declaration.declarations {
+            if self.variable_types.contains_key(&declarator.span.start) {
+                self.consumed_variable_types.insert(declarator.span.start);
+            }
+        }
+        if declaration.kind.is_var() || declaration.kind.is_using() {
+            self.error(
+                "Only let and const declarations are supported by refinement checking".into(),
+                declaration.span,
+            );
+            return Vec::new();
+        }
+        let mut output = Vec::new();
+        for mut state in states {
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    self.error(
+                        "Destructuring declarations are outside the supported refinement subset"
+                            .into(),
+                        declarator.id.span(),
+                    );
+                    continue;
+                };
+                let annotation = self.variable_types.get(&declarator.span.start).cloned();
+                let name = identifier.name.to_string();
+                if is_reserved_runtime_root(&name) {
+                    self.error(
+                        format!("'{name}' is reserved by the refinement runtime or prelude"),
+                        declarator.span,
+                    );
+                    continue;
+                }
+                if self.signatures.contains_key(&name) {
+                    self.error(
+                        format!("Declaration '{name}' shadows a refined function signature"),
+                        declarator.span,
+                    );
+                    continue;
+                }
+                if current_function.is_some_and(|(_, contract)| {
+                    contract.params.iter().any(|(param, _)| param == &name)
+                }) {
+                    self.error(
+                        format!(
+                            "Declaration shadows refined parameter '{name}', which is not supported"
+                        ),
+                        declarator.span,
+                    );
+                    continue;
+                }
+                if !Self::initialize_name(&name, &mut state) {
+                    self.error(
+                        format!("Duplicate declaration of '{name}' in one scope"),
+                        declarator.span,
+                    );
+                    continue;
+                }
+                let Some(initializer) = &declarator.init else {
+                    let loc = annotation
+                        .map(|(_, _, loc)| loc)
+                        .unwrap_or_else(|| self.location(declarator.span));
+                    self.errors.push(RtError {
+                        message: format!(
+                            "Variable '{name}' requires an initializer in refinement checking"
+                        ),
+                        loc: Some(loc),
+                    });
+                    continue;
+                };
+                if let Some(mut value) = self.infer_expression(initializer, &mut state) {
+                    value.mutable = !declaration.kind.is_const();
+                    let mut declared_predicate = None;
+                    if let Some((annotated_name, annotation, loc)) = annotation {
+                        debug_assert_eq!(annotated_name, name);
+                        self.check_base(&value.base, &annotation.base, initializer.span());
+                        value.base = annotation.base.clone();
+                        value.declared_base = Some(annotation.base.clone());
+                        let replacements = HashMap::from([(name.clone(), value.term.clone())]);
+                        if let Some(index) = &annotation.index {
+                            self.prove_index(
+                                &value,
+                                index,
+                                &replacements,
+                                &state.assumptions,
+                                format!("Initializer for '{name}' does not match its index"),
+                                loc.clone(),
+                                declarator.span,
+                            );
+                        }
+                        if let Some(predicate) = &annotation.predicate {
+                            match predicate_term(predicate, &replacements, &HashMap::new(), None) {
+                                Ok(goal) => {
+                                    self.prove(
+                                        &state.assumptions,
+                                        &goal,
+                                        format!("Initializer for '{name}' does not satisfy its refinement"),
+                                        loc,
+                                    );
+                                    declared_predicate = Some(predicate.clone());
+                                }
+                                Err(message) => self.error(message, declarator.span),
+                            }
+                        }
+                    }
+                    if declared_predicate.is_some() {
+                        value.qualifier = None;
+                    }
+                    self.bind_value(&name, value, &mut state);
+                    if let Some(predicate) = declared_predicate {
+                        let symbol = state.env[&name].term.clone();
+                        let replacements = HashMap::from([(name.clone(), symbol.clone())]);
+                        match predicate_term(&predicate, &replacements, &HashMap::new(), None) {
+                            Ok(formula) => {
+                                state.assumptions.push(formula.clone());
+                                state.env.get_mut(&name).unwrap().qualifier = Some(Qualifier {
+                                    value: symbol,
+                                    formula,
+                                });
+                            }
+                            Err(message) => self.error(message, declarator.span),
+                        }
+                    }
+                }
+            }
+            output.push(state);
+        }
+        output
+    }
+
     fn verify_statement<'a>(
         &mut self,
         statement: &'a Statement<'a>,
@@ -1147,6 +1324,8 @@ impl Verifier<'_> {
                 current
             }
             Statement::VariableDeclaration(declaration) => {
+                return self.verify_variable_declaration(declaration, states, current_function);
+                #[allow(unreachable_code)]
                 for declarator in &declaration.declarations {
                     if self.variable_types.contains_key(&declarator.span.start) {
                         self.consumed_variable_types.insert(declarator.span.start);
@@ -1287,7 +1466,12 @@ impl Verifier<'_> {
                     if let Expression::AssignmentExpression(assignment) =
                         &expression_statement.expression
                     {
-                        if assignment.operator == AssignmentOperator::Assign {
+                        if matches!(
+                            assignment.operator,
+                            AssignmentOperator::Assign
+                                | AssignmentOperator::Addition
+                                | AssignmentOperator::Subtraction
+                        ) {
                             if let Some(SimpleAssignmentTarget::AssignmentTargetIdentifier(
                                 identifier,
                             )) = assignment.left.as_simple_assignment_target()
@@ -1322,6 +1506,33 @@ impl Verifier<'_> {
                                 if let Some(mut value) =
                                     self.infer_expression(&assignment.right, &mut state)
                                 {
+                                    if assignment.operator != AssignmentOperator::Assign {
+                                        let combined = match assignment.operator {
+                                            AssignmentOperator::Addition => binary_term(
+                                                BinaryOperator::Addition,
+                                                previous.term.clone(),
+                                                value.term.clone(),
+                                            ),
+                                            AssignmentOperator::Subtraction => binary_term(
+                                                BinaryOperator::Subtraction,
+                                                previous.term.clone(),
+                                                value.term.clone(),
+                                            ),
+                                            _ => Err("Unsupported compound assignment".into()),
+                                        };
+                                        match combined {
+                                            Ok(term) => {
+                                                value.term = term;
+                                                value.base = base_for_sort(value.term.sort());
+                                                value.qualifier = None;
+                                            }
+                                            Err(message) => {
+                                                self.error(message, assignment.span);
+                                                output.push(state);
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     if let Some(expected) = &previous.declared_base {
                                         self.check_base(
                                             &value.base,
@@ -1422,13 +1633,28 @@ impl Verifier<'_> {
                             return_statement.span,
                         );
                     }
+                    let mut replacements = HashMap::from([("$".to_string(), value.term.clone())]);
+                    for (param_name, term) in &state.entry_params {
+                        replacements.insert(param_name.clone(), term.clone());
+                    }
+                    if let Some(index) = &contract.ret.index {
+                        self.prove_index(
+                            &value,
+                            index,
+                            &replacements,
+                            &state.assumptions,
+                            format!("Return value of '{function_name}' does not match its index"),
+                            contract.loc.clone(),
+                            return_statement.span,
+                        );
+                    }
                     if let Some(predicate) = &contract.ret.predicate {
-                        let mut replacements =
-                            HashMap::from([("$".to_string(), value.term.clone())]);
-                        for (param_name, term) in &state.entry_params {
-                            replacements.insert(param_name.clone(), term.clone());
-                        }
-                        match predicate_term(predicate, &replacements, &HashMap::new(), None) {
+                        match predicate_term(
+                            predicate,
+                            &replacements,
+                            &HashMap::new(),
+                            Some(value.term.sort()),
+                        ) {
                             Ok(goal) => self.prove(
                                 &state.assumptions,
                                 &goal,
@@ -1442,6 +1668,48 @@ impl Verifier<'_> {
                 Vec::new()
             }
             Statement::EmptyStatement(_) => states,
+            Statement::WhileStatement(while_statement) => self.verify_loop(
+                Some(&while_statement.test),
+                None,
+                &while_statement.body,
+                while_statement.span,
+                states,
+                current_function,
+            ),
+            Statement::ForStatement(for_statement) => {
+                let mut current = states;
+                if let Some(init) = &for_statement.init {
+                    match init {
+                        oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration) => {
+                            current = self.verify_variable_declaration(
+                                declaration,
+                                current,
+                                current_function,
+                            );
+                        }
+                        other => {
+                            for state in &mut current {
+                                if let Some(expression) = other.as_expression() {
+                                    self.infer_expression(expression, state);
+                                } else {
+                                    self.error(
+                                        "Unsupported for-loop initializer".into(),
+                                        for_statement.span,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                self.verify_loop(
+                    for_statement.test.as_ref(),
+                    for_statement.update.as_ref(),
+                    &for_statement.body,
+                    for_statement.span,
+                    current,
+                    current_function,
+                )
+            }
             _ => {
                 self.error(
                     "Statement is outside the supported static refinement subset".into(),
@@ -1466,8 +1734,8 @@ impl Verifier<'_> {
                     );
                     return None;
                 }
-                let term = Term::Number(literal.value as i64);
-                let placeholder = Term::Var(self.fresh_name("literal"), Sort::Number);
+                let term = Term::Int(literal.value as i64);
+                let placeholder = Term::Var(self.fresh_name("literal"), Sort::Int);
                 Some(Value {
                     term: term.clone(),
                     base: number_type(),
@@ -1500,7 +1768,7 @@ impl Verifier<'_> {
             Expression::StringLiteral(literal) => {
                 let term = Term::String(literal.value.to_string());
                 let placeholder = Term::Var(self.fresh_name("literal"), Sort::String);
-                let length = Term::Member(Box::new(term.clone()), "length".into(), Sort::Number);
+                let length = collection_length(&term);
                 let formula = Term::And(
                     Box::new(Term::Eq(
                         Box::new(placeholder.clone()),
@@ -1508,7 +1776,7 @@ impl Verifier<'_> {
                     )),
                     Box::new(Term::Eq(
                         Box::new(length),
-                        Box::new(Term::Number(literal.value.encode_utf16().count() as i64)),
+                        Box::new(Term::Int(literal.value.encode_utf16().count() as i64)),
                     )),
                 );
                 Some(Value {
@@ -1626,10 +1894,21 @@ impl Verifier<'_> {
                     UnaryOperator::LogicalNot if value_sort == Sort::Bool => {
                         Term::Not(Box::new(value.term))
                     }
-                    UnaryOperator::UnaryNegation if value_sort == Sort::Number => {
-                        Term::Sub(Box::new(Term::Number(0)), Box::new(value.term))
+                    UnaryOperator::UnaryNegation
+                        if matches!(value.term.sort(), Sort::Number | Sort::Int) =>
+                    {
+                        let zero = if value.term.sort() == Sort::Int {
+                            Term::Int(0)
+                        } else {
+                            Term::Number(0)
+                        };
+                        Term::Sub(Box::new(zero), Box::new(value.term))
                     }
-                    UnaryOperator::UnaryPlus if value_sort == Sort::Number => value.term,
+                    UnaryOperator::UnaryPlus
+                        if matches!(value.term.sort(), Sort::Number | Sort::Int) =>
+                    {
+                        value.term
+                    }
                     _ => {
                         self.error(
                             "Unsupported unary expression in refinement analysis".into(),
@@ -1706,6 +1985,10 @@ impl Verifier<'_> {
                     local_implementation: false,
                 })
             }
+            Expression::AssignmentExpression(assignment) => {
+                self.infer_assignment_expression(assignment, state)
+            }
+            Expression::UpdateExpression(update) => self.infer_update(update, state),
             Expression::CallExpression(call) => self.infer_call(call, state),
             Expression::StaticMemberExpression(member) => self.infer_static_member(member, state),
             Expression::ComputedMemberExpression(member) => {
@@ -1728,6 +2011,148 @@ impl Verifier<'_> {
         }
     }
 
+    fn infer_assignment_expression(
+        &mut self,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        state: &mut State,
+    ) -> Option<Value> {
+        if !matches!(
+            assignment.operator,
+            AssignmentOperator::Assign
+                | AssignmentOperator::Addition
+                | AssignmentOperator::Subtraction
+        ) {
+            self.error(
+                "Compound assignment is outside the supported static refinement subset".into(),
+                assignment.span,
+            );
+            return None;
+        }
+        let Some(SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier)) =
+            assignment.left.as_simple_assignment_target()
+        else {
+            self.error(
+                "Only identifier assignment is supported by refinement checking".into(),
+                assignment.left.span(),
+            );
+            return None;
+        };
+        let name = identifier.name.as_str();
+        let Some(previous) = state.env.get(name).cloned() else {
+            self.error(
+                format!("Assignment to untracked variable '{name}'"),
+                identifier.span,
+            );
+            return None;
+        };
+        if !previous.mutable {
+            self.error(
+                format!("Assignment to immutable binding '{name}'"),
+                assignment.span,
+            );
+            return None;
+        }
+        let mut value = self.infer_expression(&assignment.right, state)?;
+        if assignment.operator != AssignmentOperator::Assign {
+            let combined = match assignment.operator {
+                AssignmentOperator::Addition => binary_term(
+                    BinaryOperator::Addition,
+                    previous.term.clone(),
+                    value.term.clone(),
+                ),
+                AssignmentOperator::Subtraction => binary_term(
+                    BinaryOperator::Subtraction,
+                    previous.term.clone(),
+                    value.term.clone(),
+                ),
+                _ => Err("Unsupported compound assignment".into()),
+            };
+            match combined {
+                Ok(term) => {
+                    value.term = term;
+                    value.base = base_for_sort(value.term.sort());
+                    value.qualifier = None;
+                }
+                Err(message) => {
+                    self.error(message, assignment.span);
+                    return None;
+                }
+            }
+        }
+        if let Some(expected) = &previous.declared_base {
+            self.check_base(&value.base, expected, assignment.right.span());
+            value.declared_base = Some(expected.clone());
+        }
+        value.mutable = previous.mutable;
+        let result = value.clone();
+        self.bind_value(name, value, state);
+        Some(result)
+    }
+
+    fn infer_update(
+        &mut self,
+        update: &oxc_ast::ast::UpdateExpression<'_>,
+        state: &mut State,
+    ) -> Option<Value> {
+        let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = &update.argument
+        else {
+            self.error(
+                "Only identifier increment/decrement is supported by refinement checking".into(),
+                update.span,
+            );
+            return None;
+        };
+        let name = identifier.name.as_str();
+        let Some(previous) = state.env.get(name).cloned() else {
+            self.error(
+                format!("Update of untracked variable '{name}'"),
+                identifier.span,
+            );
+            return None;
+        };
+        if !previous.mutable {
+            self.error(format!("Update of immutable binding '{name}'"), update.span);
+            return None;
+        }
+        if !is_numeric_sort(previous.term.sort()) {
+            self.error(
+                "Increment and decrement require a numeric binding".into(),
+                update.span,
+            );
+            return None;
+        }
+        let one = one_for(&previous.term);
+        let operator = match update.operator {
+            UpdateOperator::Increment => BinaryOperator::Addition,
+            UpdateOperator::Decrement => BinaryOperator::Subtraction,
+        };
+        let next = match binary_term(operator, previous.term.clone(), one) {
+            Ok(term) => term,
+            Err(message) => {
+                self.error(message, update.span);
+                return None;
+            }
+        };
+        let result = if update.prefix {
+            next.clone()
+        } else {
+            previous.term.clone()
+        };
+        let mut value = previous.clone();
+        value.term = next;
+        value.qualifier = None;
+        self.bind_value(name, value, state);
+        Some(Value {
+            term: result,
+            base: number_type(),
+            declared_base: None,
+            qualifier: None,
+            mutable: true,
+            catalog_trusted: true,
+            local_implementation: false,
+        })
+    }
+
     fn infer_array(
         &mut self,
         array: &oxc_ast::ast::ArrayExpression<'_>,
@@ -1737,12 +2162,8 @@ impl Verifier<'_> {
         let mut element_types = Vec::new();
         let mut local_implementation = false;
         let mut facts = vec![Term::Eq(
-            Box::new(Term::Member(
-                Box::new(reference.clone()),
-                "length".into(),
-                Sort::Number,
-            )),
-            Box::new(Term::Number(array.elements.len() as i64)),
+            Box::new(collection_length(&reference)),
+            Box::new(Term::Int(array.elements.len() as i64)),
         )];
 
         for (index, element) in array.elements.iter().enumerate() {
@@ -1763,7 +2184,7 @@ impl Verifier<'_> {
             facts.push(Term::Same(
                 Box::new(Term::Index(
                     Box::new(reference.clone()),
-                    Box::new(Term::Number(index as i64)),
+                    Box::new(Term::Int(index as i64)),
                     sort_for_base(&value.base),
                 )),
                 Box::new(value.term),
@@ -1791,10 +2212,7 @@ impl Verifier<'_> {
         let ImportBinding::Export { module, export } = self.imports.get(name)?.clone() else {
             return Some(self.ambient_value(
                 &format!("import::{name}"),
-                &RefinementType {
-                    base: BaseType::Named("ModuleNamespace".into()),
-                    predicate: None,
-                },
+                &RefinementType::from_base(BaseType::Named("ModuleNamespace".into())),
                 state,
             ));
         };
@@ -2395,10 +2813,7 @@ impl Verifier<'_> {
             (BaseType::Object(fields), property) => fields
                 .iter()
                 .find(|(name, _)| name == property)
-                .map(|(_, ty)| RefinementType {
-                    base: ty.clone(),
-                    predicate: None,
-                }),
+                .map(|(_, ty)| RefinementType::from_base(ty.clone())),
             _ => None,
         };
         let (property_refinement, property_catalog_trusted) =
@@ -2431,11 +2846,12 @@ impl Verifier<'_> {
                 return None;
             };
         let property_type = property_refinement.base.clone();
-        let term = Term::Member(
-            Box::new(object.term),
-            property.to_string(),
-            sort_for_base(&property_type),
-        );
+        let member_sort = if property == "length" && intrinsic_property {
+            Sort::Int
+        } else {
+            sort_for_base(&property_type)
+        };
+        let term = Term::Member(Box::new(object.term), property.to_string(), member_sort);
         let placeholder = Term::Var(self.fresh_name(property), term.sort());
         let mut qualifier_formula =
             Term::Same(Box::new(placeholder.clone()), Box::new(term.clone()));
@@ -2500,13 +2916,16 @@ impl Verifier<'_> {
             );
             return None;
         }
-        if !matches!(index.term, Term::Number(_)) {
-            self.error(
-                "Only statically known integer indices are currently supported".into(),
-                member.expression.span(),
-            );
-            return None;
-        }
+        let index_term = match as_int_term(&index.term) {
+            Some(term) => term,
+            None => {
+                self.error(
+                    "Array indices must be logical integers".into(),
+                    member.expression.span(),
+                );
+                return None;
+            }
+        };
         let element_type = match &object.base {
             BaseType::Generic(name, arguments) if name == "DenseArray" && arguments.len() == 1 => {
                 arguments[0].clone()
@@ -2537,21 +2956,24 @@ impl Verifier<'_> {
                 return None;
             }
         };
-        let length = Term::Member(Box::new(object.term.clone()), "length".into(), Sort::Number);
+        let length = collection_length(&object.term);
         let bounds = Term::And(
             Box::new(Term::Ge(
-                Box::new(index.term.clone()),
-                Box::new(Term::Number(0)),
+                Box::new(index_term.clone()),
+                Box::new(Term::Int(0)),
             )),
             Box::new(Term::Lt(
-                Box::new(index.term.clone()),
+                Box::new(index_term.clone()),
                 Box::new(length.clone()),
             )),
         );
-        let Term::Number(index_value) = index.term else {
-            unreachable!("computed member indices were restricted to numeric literals above")
-        };
-        if let Some(length_value) = known_number_equality(&state.assumptions, &length) {
+        if let (Some(index_value), Some(length_value)) = (
+            known_number_equality(&state.assumptions, &index_term).or(match &index_term {
+                Term::Int(value) => Some(*value),
+                _ => None,
+            }),
+            known_number_equality(&state.assumptions, &length),
+        ) {
             if index_value < 0 || index_value >= length_value {
                 self.error(
                     "Indexed access may be outside the collection bounds".into(),
@@ -2569,7 +2991,7 @@ impl Verifier<'_> {
         }
         let term = Term::Index(
             Box::new(object.term),
-            Box::new(Term::Number(index_value)),
+            Box::new(index_term),
             sort_for_base(&element_type),
         );
         Some(Value {
@@ -2837,10 +3259,7 @@ impl Verifier<'_> {
         }
         state.library_semantics_intact &= callback_state.library_semantics_intact;
         let local_implementation = result.local_implementation;
-        let actual_return = RefinementType {
-            base: result.base,
-            predicate: None,
-        };
+        let actual_return = RefinementType::from_base(result.base);
         Some(Value {
             term: Term::Var(self.fresh_name("callback"), Sort::Ref),
             base: BaseType::Function(actual_params, Box::new(actual_return)),
@@ -3197,12 +3616,8 @@ impl Verifier<'_> {
                 || !signature.effects.callbacks.is_empty()
                 || signature.effects.writes_ambient_state;
             needs_snapshot.then(|| {
-                let member = Term::Member(
-                    Box::new(receiver.term.clone()),
-                    "length".into(),
-                    Sort::Number,
-                );
-                let snapshot = Term::Var(self.fresh_name("old_length"), Sort::Number);
+                let member = collection_length(&receiver.term);
+                let snapshot = Term::Var(self.fresh_name("old_length"), Sort::Int);
                 snapshot_heap_measure(state, &member, &snapshot);
                 snapshot
             })
@@ -3326,15 +3741,8 @@ impl Verifier<'_> {
             }
         }
         if trust_catalog_refinements && let Some(receiver) = &receiver {
-            let receiver_length = old_length.unwrap_or_else(|| {
-                Term::Member(
-                    Box::new(receiver.term.clone()),
-                    "length".into(),
-                    Sort::Number,
-                )
-            });
-            let result_length =
-                Term::Member(Box::new(result.clone()), "length".into(), Sort::Number);
+            let receiver_length = old_length.unwrap_or_else(|| collection_length(&receiver.term));
+            let result_length = collection_length(&result);
             for refinement in &signature.refinements {
                 match refinement {
                     SemanticRefinement::ResultLengthEqualsReceiver => {
@@ -3350,19 +3758,53 @@ impl Verifier<'_> {
                     SemanticRefinement::ReceiverLengthIncreasesByArgumentCount => {
                         let post_length = Term::Add(
                             Box::new(receiver_length.clone()),
-                            Box::new(Term::Number(call.arguments.len() as i64)),
+                            Box::new(Term::Int(call.arguments.len() as i64)),
                         );
                         result_facts.push(Term::Same(
                             Box::new(result.clone()),
                             Box::new(post_length.clone()),
                         ));
                         result_facts.push(Term::Same(
-                            Box::new(Term::Member(
-                                Box::new(receiver.term.clone()),
-                                "length".into(),
-                                Sort::Number,
-                            )),
+                            Box::new(collection_length(&receiver.term)),
                             Box::new(post_length),
+                        ));
+                        for (offset, (_, argument)) in arguments.iter().enumerate() {
+                            let index = Term::Add(
+                                Box::new(receiver_length.clone()),
+                                Box::new(Term::Int(offset as i64)),
+                            );
+                            result_facts.push(Term::Same(
+                                Box::new(Term::Index(
+                                    Box::new(receiver.term.clone()),
+                                    Box::new(index),
+                                    argument.term.sort(),
+                                )),
+                                Box::new(argument.term.clone()),
+                            ));
+                        }
+                    }
+                    SemanticRefinement::RequiresPositiveReceiverLength => {
+                        self.prove(
+                            &state.assumptions,
+                            &Term::Gt(Box::new(receiver_length.clone()), Box::new(Term::Int(0))),
+                            format!("'{display_name}' requires a non-empty dense array"),
+                            self.location(call.span),
+                        );
+                    }
+                    SemanticRefinement::ReceiverLengthDecreasesByOne => {
+                        let last =
+                            Term::Sub(Box::new(receiver_length.clone()), Box::new(Term::Int(1)));
+                        result_facts.push(Term::Same(
+                            Box::new(result.clone()),
+                            Box::new(Term::Index(
+                                Box::new(receiver.term.clone()),
+                                Box::new(last.clone()),
+                                result.sort(),
+                            )),
+                        ));
+                        result_facts.push(Term::Same(
+                            Box::new(collection_length(&receiver.term)),
+                            Box::new(last),
                         ));
                     }
                     SemanticRefinement::TypeGuard { .. }
@@ -3537,6 +3979,11 @@ impl Verifier<'_> {
             arguments.push(self.infer_expression(expression, state)?);
         }
 
+        for argument in &arguments {
+            if let Some(qualifier) = &argument.qualifier {
+                state.assumptions.push(qualifier.formula.clone());
+            }
+        }
         let replacements: HashMap<String, Term> = contract
             .params
             .iter()
@@ -3562,17 +4009,43 @@ impl Verifier<'_> {
             }
         }
 
-        for (((_, parameter), argument), index) in
+        let index_names = index_names_in_contract(&contract);
+        for (((name, parameter), argument), arg_index) in
             contract.params.iter().zip(&arguments).zip(0usize..)
         {
+            if index_names.contains(name)
+                && matches!(&parameter.base, BaseType::Primitive(kind) if kind == "number")
+                && as_int_term(&argument.term).is_none()
+            {
+                self.error(
+                    format!(
+                        "Index parameter '{name}' of '{function_name}' requires a safe integer"
+                    ),
+                    call.arguments[arg_index].span(),
+                );
+            }
             self.check_base(&argument.base, &parameter.base, call.span);
             if base_requires_catalog_identity(&parameter.base) && !argument.catalog_trusted {
                 self.error(
                     format!(
                         "Argument {} to '{function_name}' does not have a verified standard-library identity",
-                        index + 1
+                        arg_index + 1
                     ),
-                    call.arguments[index].span(),
+                    call.arguments[arg_index].span(),
+                );
+            }
+            if let Some(index) = &parameter.index {
+                self.prove_index(
+                    argument,
+                    index,
+                    &replacements,
+                    &state.assumptions,
+                    format!(
+                        "Argument {} to '{function_name}' does not match its index",
+                        arg_index + 1
+                    ),
+                    self.location(call.span),
+                    call.span,
                 );
             }
             if let Some(predicate) = &parameter.predicate {
@@ -3582,7 +4055,7 @@ impl Verifier<'_> {
                         &goal,
                         format!(
                             "Argument {} to '{function_name}' does not satisfy its refinement",
-                            index + 1
+                            arg_index + 1
                         ),
                         self.location(call.span),
                     ),
@@ -3611,27 +4084,44 @@ impl Verifier<'_> {
 
         let result = Term::Var(
             self.fresh_name(&function_name),
-            sort_for_base(&contract.ret.base),
+            sort_for_indexed_type(&contract.ret),
         );
-        let qualifier = if let Some(predicate) = &contract.ret.predicate {
+        let mut result_facts = Vec::new();
+        if let Some(index) = &contract.ret.index {
+            match predicate_term(index, &replacements, &predicate_arguments, Some(Sort::Int)) {
+                Ok(index_term) => {
+                    let result_value = Value {
+                        term: result.clone(),
+                        base: contract.ret.base.clone(),
+                        declared_base: None,
+                        qualifier: None,
+                        mutable: true,
+                        catalog_trusted: declared_base_has_catalog_identity(&contract.ret.base),
+                        local_implementation: false,
+                    };
+                    result_facts.push(index_formula(&result_value, &index_term));
+                }
+                Err(message) => self.error(message, call.span),
+            }
+        }
+        if let Some(predicate) = &contract.ret.predicate {
             let mut result_replacements = replacements;
             result_replacements.insert("$".into(), result.clone());
-            match predicate_term(predicate, &result_replacements, &predicate_arguments, None) {
-                Ok(formula) => {
-                    state.assumptions.push(formula.clone());
-                    Some(Qualifier {
-                        value: result.clone(),
-                        formula,
-                    })
-                }
-                Err(message) => {
-                    self.error(message, call.span);
-                    None
-                }
+            match predicate_term(
+                predicate,
+                &result_replacements,
+                &predicate_arguments,
+                Some(result.sort()),
+            ) {
+                Ok(formula) => result_facts.push(formula),
+                Err(message) => self.error(message, call.span),
             }
-        } else {
-            None
-        };
+        }
+        state.assumptions.extend(result_facts.iter().cloned());
+        let qualifier = (!result_facts.is_empty()).then(|| Qualifier {
+            value: result.clone(),
+            formula: and_terms(result_facts),
+        });
         state
             .assumptions
             .extend(intrinsic_refinements(&contract.ret.base, &result));
@@ -3660,7 +4150,7 @@ impl Verifier<'_> {
     }
 
     fn bind_value(&mut self, name: &str, value: Value, state: &mut State) {
-        let symbol = Term::Var(self.fresh_name(name), sort_for_base(&value.base));
+        let symbol = Term::Var(self.fresh_name(name), value.term.sort());
         let local_reference = value.local_implementation && symbol.sort() == Sort::Ref;
         let binding_fact = Term::Same(Box::new(symbol.clone()), Box::new(value.term.clone()));
         record_reference_provenance_edges(&binding_fact, &mut state.provenance_edges);
@@ -3807,6 +4297,202 @@ impl Verifier<'_> {
         }
     }
 
+    fn obligation_holds(&self, assumptions: &[Term], goal: &Term) -> bool {
+        let constraint = FixpointConstraint {
+            assumptions,
+            consequent: goal,
+        };
+        matches!(solve_constraint(&constraint), Ok(SatResult::Unsat))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prove_index(
+        &mut self,
+        value: &Value,
+        index: &PredicateExpr,
+        replacements: &HashMap<String, Term>,
+        assumptions: &[Term],
+        message: String,
+        loc: SourceLocation,
+        span: Span,
+    ) {
+        match predicate_term(index, replacements, &HashMap::new(), Some(Sort::Int)) {
+            Ok(index_term) => {
+                let goal = index_formula(value, &index_term);
+                self.prove(assumptions, &goal, message, loc);
+            }
+            Err(error) => self.error(error, span),
+        }
+    }
+
+    fn verify_loop(
+        &mut self,
+        test: Option<&Expression<'_>>,
+        update: Option<&Expression<'_>>,
+        body: &Statement<'_>,
+        span: Span,
+        states: Vec<State>,
+        current_function: Option<(&str, &Contract)>,
+    ) -> Vec<State> {
+        if states.is_empty() {
+            return Vec::new();
+        }
+        let assigned = assigned_names_in_statement(body)
+            .union(&update.map(assigned_names_in_expression).unwrap_or_default())
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut invariants = scrape_loop_candidates(&states, &assigned, current_function);
+        loop {
+            let current = invariants.clone();
+            let mut next = Vec::new();
+            for candidate in &current {
+                if self.candidate_holds_on_entry(&states, candidate)
+                    && self.candidate_preserved_by_body(
+                        &states,
+                        candidate,
+                        &current,
+                        test,
+                        update,
+                        body,
+                        current_function,
+                        span,
+                    )
+                {
+                    next.push(candidate.clone());
+                }
+            }
+            if next.len() == current.len() {
+                invariants = next;
+                break;
+            }
+            invariants = next;
+        }
+
+        let mut output = Vec::new();
+        for state in states {
+            let mut body_state = state.clone();
+            self.havoc_assigned(&assigned, &mut body_state);
+            let extra = invariants
+                .iter()
+                .filter_map(|candidate| candidate.instantiate(&body_state))
+                .collect::<Vec<_>>();
+            body_state.assumptions.extend(extra.clone());
+            if let Some(test) = test {
+                let Some(test_value) = self.infer_expression(test, &mut body_state) else {
+                    continue;
+                };
+                if value_sort(&test_value) != Some(Sort::Bool)
+                    && test_value.term.sort() != Sort::Bool
+                {
+                    self.error("Loop condition must be boolean".into(), test.span());
+                    continue;
+                }
+                let mut taken = body_state.clone();
+                taken.assumptions.push(test_value.term.clone());
+                let mut after_body = self.verify_statement(body, vec![taken], current_function);
+                if let Some(update) = update {
+                    for state in &mut after_body {
+                        self.infer_expression(update, state);
+                    }
+                }
+                let mut exit = body_state;
+                exit.assumptions.push(Term::Not(Box::new(test_value.term)));
+                output.push(exit);
+            } else {
+                let _ = self.verify_statement(body, vec![body_state.clone()], current_function);
+                output.push(body_state);
+            }
+        }
+        output
+    }
+
+    fn candidate_holds_on_entry(&self, states: &[State], candidate: &LoopCandidate) -> bool {
+        states.iter().all(|state| {
+            candidate
+                .instantiate(state)
+                .is_some_and(|goal| self.obligation_holds(&state.assumptions, &goal))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_preserved_by_body(
+        &mut self,
+        states: &[State],
+        candidate: &LoopCandidate,
+        invariants: &[LoopCandidate],
+        test: Option<&Expression<'_>>,
+        update: Option<&Expression<'_>>,
+        body: &Statement<'_>,
+        current_function: Option<(&str, &Contract)>,
+        span: Span,
+    ) -> bool {
+        let errors_before = self.errors.len();
+        let assigned = assigned_names_in_statement(body)
+            .union(&update.map(assigned_names_in_expression).unwrap_or_default())
+            .cloned()
+            .collect::<HashSet<_>>();
+        for state in states {
+            let mut head = state.clone();
+            self.havoc_assigned(&assigned, &mut head);
+            let extra = invariants
+                .iter()
+                .filter_map(|candidate| candidate.instantiate(&head))
+                .collect::<Vec<_>>();
+            head.assumptions.extend(extra);
+            if let Some(test) = test {
+                let Some(test_value) = self.infer_expression(test, &mut head) else {
+                    self.errors.truncate(errors_before);
+                    return false;
+                };
+                head.assumptions.push(test_value.term);
+            }
+            let mut after = self.verify_statement(body, vec![head], current_function);
+            if let Some(update) = update {
+                for state in &mut after {
+                    self.infer_expression(update, state);
+                }
+            }
+            let preserved = !after.is_empty()
+                && after.iter().all(|state| {
+                    candidate
+                        .instantiate(state)
+                        .is_some_and(|goal| self.obligation_holds(&state.assumptions, &goal))
+                });
+            self.errors.truncate(errors_before);
+            if !preserved {
+                let _ = span;
+                return false;
+            }
+        }
+        true
+    }
+
+    fn havoc_assigned(&mut self, assigned: &HashSet<String>, state: &mut State) {
+        for name in assigned {
+            let Some(previous) = state.env.get(name).cloned() else {
+                continue;
+            };
+            let fresh = Term::Var(self.fresh_name(name), previous.term.sort());
+            if let Some(qualifier) = &previous.qualifier {
+                state
+                    .assumptions
+                    .retain(|fact| !contains_term(fact, &previous.term));
+                let _ = qualifier;
+            }
+            state
+                .assumptions
+                .retain(|fact| !contains_term(fact, &previous.term));
+            let mut next = previous;
+            next.term = fresh;
+            next.qualifier = None;
+            state.env.insert(name.clone(), next);
+        }
+        // The loop exit is this havoc'd head plus the negated test, not the
+        // body's post-state. Keeping the entry length would accept empty pop
+        // and OOB indexing after a loop that drained the array.
+        invalidate_heap_facts(state);
+    }
+
     fn fresh_name(&mut self, prefix: &str) -> String {
         self.fresh += 1;
         format!("{prefix}#{}", self.fresh)
@@ -3835,8 +4521,59 @@ impl Verifier<'_> {
     }
 }
 
+fn int_conversion_axioms(terms: &[&Term]) -> Vec<Term> {
+    let mut literals = HashSet::new();
+    for term in terms {
+        collect_int_literals(term, &mut literals);
+    }
+    literals
+        .into_iter()
+        .map(|value| {
+            Term::Eq(
+                Box::new(Term::ToNumber(Box::new(Term::Int(value)))),
+                Box::new(Term::Number(value)),
+            )
+        })
+        .collect()
+}
+
+fn collect_int_literals(term: &Term, output: &mut HashSet<i64>) {
+    match term {
+        Term::Int(value) => {
+            output.insert(*value);
+        }
+        Term::Add(left, right)
+        | Term::Sub(left, right)
+        | Term::Mul(left, right)
+        | Term::Same(left, right)
+        | Term::Eq(left, right)
+        | Term::Ne(left, right)
+        | Term::Gt(left, right)
+        | Term::Lt(left, right)
+        | Term::Ge(left, right)
+        | Term::Le(left, right)
+        | Term::And(left, right)
+        | Term::Or(left, right)
+        | Term::Index(left, right, _) => {
+            collect_int_literals(left, output);
+            collect_int_literals(right, output);
+        }
+        Term::Not(inner)
+        | Term::Pred(_, inner)
+        | Term::Member(inner, _, _)
+        | Term::ToNumber(inner) => collect_int_literals(inner, output),
+        Term::Number(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => {}
+    }
+}
+
 fn solve_constraint(constraint: &FixpointConstraint<'_>) -> Result<SatResult, String> {
-    let (assumptions, consequent) = abstract_predicate_applications(constraint)?;
+    let (mut assumptions, consequent) = abstract_predicate_applications(constraint)?;
+    assumptions.extend(int_conversion_axioms(
+        &assumptions
+            .iter()
+            .chain(std::iter::once(&consequent))
+            .collect::<Vec<_>>(),
+    ));
     if assumptions.contains(&consequent) {
         return Ok(SatResult::Unsat);
     }
@@ -3854,7 +4591,7 @@ fn solve_constraint(constraint: &FixpointConstraint<'_>) -> Result<SatResult, St
     for assumption in &assumptions {
         match to_z3(assumption)? {
             ZTerm::Bool(value) => body.push(value),
-            ZTerm::Number(_) | ZTerm::String(_) | ZTerm::Ref(_) => {
+            ZTerm::Number(_) | ZTerm::Int(_) | ZTerm::String(_) | ZTerm::Ref(_) => {
                 return Err("Fixpoint assumption is not boolean".into());
             }
         }
@@ -3871,6 +4608,11 @@ fn solve_constraint(constraint: &FixpointConstraint<'_>) -> Result<SatResult, St
         .iter()
         .filter(|(_, sort)| *sort == Sort::Number)
         .map(|(name, _)| Float::new_const_double(name.as_str()))
+        .collect();
+    let int_vars: Vec<Z3Int> = variables
+        .iter()
+        .filter(|(_, sort)| *sort == Sort::Int)
+        .map(|(name, _)| Z3Int::new_const(name.as_str()))
         .collect();
     let bool_vars: Vec<Bool> = variables
         .iter()
@@ -3889,14 +4631,20 @@ fn solve_constraint(constraint: &FixpointConstraint<'_>) -> Result<SatResult, St
         .map(|(name, _)| Dynamic::new_const(name.as_str(), &reference_sort))
         .collect();
     let mut bounds: Vec<&dyn Ast> = number_vars.iter().map(|var| var as &dyn Ast).collect();
+    bounds.extend(int_vars.iter().map(|var| var as &dyn Ast));
     bounds.extend(bool_vars.iter().map(|var| var as &dyn Ast));
     bounds.extend(string_vars.iter().map(|var| var as &dyn Ast));
     bounds.extend(reference_vars.iter().map(|var| var as &dyn Ast));
     let rule = ast::forall_const(&bounds, &[], &rule);
     fixedpoint.add_rule(&rule, Some("refinement_violation"));
     match fixedpoint.query(&bad) {
-        SatResult::Unknown => solve_constraint_with_smt(&assumptions, &consequent),
-        result => Ok(result),
+        SatResult::Sat => Ok(SatResult::Sat),
+        SatResult::Unknown | SatResult::Unsat => {
+            // Fixedpoint may report Unsat for IEEE-754 obligations that SMT
+            // still finds a counterexample for (for example `x === x` on NaN).
+            // Only SMT Unsat is a proof; Sat/Unknown fail closed.
+            solve_constraint_with_smt(&assumptions, &consequent)
+        }
     }
 }
 
@@ -4046,7 +4794,12 @@ fn replace_predicate_applications(term: &Term, atoms: &mut Vec<(String, Term, Te
             Box::new(replace_predicate_applications(right, atoms)),
         ),
         Term::Not(inner) => Term::Not(Box::new(replace_predicate_applications(inner, atoms))),
-        Term::Number(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => term.clone(),
+        Term::ToNumber(inner) => {
+            Term::ToNumber(Box::new(replace_predicate_applications(inner, atoms)))
+        }
+        Term::Number(_) | Term::Int(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => {
+            term.clone()
+        }
     }
 }
 
@@ -4060,7 +4813,11 @@ fn predicate_term(
         PredicateExpr::Literal(Literal::Number(value))
             if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991_f64 =>
         {
-            Ok(Term::Number(*value as i64))
+            if expected == Some(Sort::Number) {
+                Ok(Term::Number(*value as i64))
+            } else {
+                Ok(Term::Int(*value as i64))
+            }
         }
         PredicateExpr::Literal(Literal::Boolean(value)) => Ok(Term::Bool(*value)),
         PredicateExpr::Literal(Literal::String(value)) => Ok(Term::String(value.clone())),
@@ -4077,7 +4834,11 @@ fn predicate_term(
             .ok_or_else(|| "No symbolic return value".into()),
         PredicateExpr::Member(object, property) => {
             let object = predicate_term(object, replacements, predicate_arguments, None)?;
-            let sort = expected.unwrap_or(Sort::Number);
+            let sort = if property == "length" {
+                Sort::Int
+            } else {
+                expected.unwrap_or(Sort::Number)
+            };
             Ok(Term::Member(Box::new(object), property.clone(), sort))
         }
         PredicateExpr::PredicateApply(name, argument) => {
@@ -4111,15 +4872,68 @@ fn predicate_term(
                 BinaryOp::EqEqEq | BinaryOp::NotEqEq | BinaryOp::EqEq | BinaryOp::NotEq => {
                     predicate_literal_sort(left)
                         .or_else(|| predicate_literal_sort(right))
-                        .unwrap_or(Sort::Number)
+                        .unwrap_or_else(|| {
+                            inferred_numeric_sort(left, right, replacements, expected)
+                        })
                 }
-                _ => Sort::Number,
+                _ => inferred_numeric_sort(left, right, replacements, expected),
             };
             let left = predicate_term(left, replacements, predicate_arguments, Some(operand_sort))?;
             let right =
                 predicate_term(right, replacements, predicate_arguments, Some(operand_sort))?;
             predicate_binary(operator, left, right)
         }
+    }
+}
+
+fn inferred_numeric_sort(
+    left: &PredicateExpr,
+    right: &PredicateExpr,
+    replacements: &HashMap<String, Term>,
+    expected: Option<Sort>,
+) -> Sort {
+    if expected == Some(Sort::Int) {
+        return Sort::Int;
+    }
+    if expected == Some(Sort::Number) {
+        return Sort::Number;
+    }
+    let mut sorts = Vec::new();
+    collect_replacement_sorts(left, replacements, &mut sorts);
+    collect_replacement_sorts(right, replacements, &mut sorts);
+    if !sorts.is_empty() && sorts.iter().all(|sort| *sort == Sort::Int) {
+        Sort::Int
+    } else {
+        Sort::Number
+    }
+}
+
+fn collect_replacement_sorts(
+    predicate: &PredicateExpr,
+    replacements: &HashMap<String, Term>,
+    sorts: &mut Vec<Sort>,
+) {
+    match predicate {
+        PredicateExpr::Identifier(name) => {
+            if let Some(term) = replacements.get(name) {
+                sorts.push(term.sort());
+            }
+        }
+        PredicateExpr::Return => {
+            if let Some(term) = replacements.get("$") {
+                sorts.push(term.sort());
+            }
+        }
+        PredicateExpr::Member(object, _)
+        | PredicateExpr::Not(object)
+        | PredicateExpr::PredicateApply(_, object) => {
+            collect_replacement_sorts(object, replacements, sorts);
+        }
+        PredicateExpr::Binary(_, left, right) | PredicateExpr::Logical(_, left, right) => {
+            collect_replacement_sorts(left, replacements, sorts);
+            collect_replacement_sorts(right, replacements, sorts);
+        }
+        PredicateExpr::Literal(_) => {}
     }
 }
 
@@ -4132,35 +4946,45 @@ fn predicate_literal_sort(predicate: &PredicateExpr) -> Option<Sort> {
     }
 }
 
+fn is_numeric_sort(sort: Sort) -> bool {
+    matches!(sort, Sort::Number | Sort::Int)
+}
+
 fn predicate_binary(operator: &BinaryOp, left: Term, right: Term) -> Result<Term, String> {
     let left_sort = left.sort();
     let right_sort = right.sort();
     Ok(match operator {
-        BinaryOp::EqEqEq | BinaryOp::EqEq if left_sort == right_sort => {
+        BinaryOp::EqEqEq | BinaryOp::EqEq
+            if left_sort == right_sort
+                || (is_numeric_sort(left_sort) && is_numeric_sort(right_sort)) =>
+        {
             Term::Eq(Box::new(left), Box::new(right))
         }
-        BinaryOp::NotEqEq | BinaryOp::NotEq if left_sort == right_sort => {
+        BinaryOp::NotEqEq | BinaryOp::NotEq
+            if left_sort == right_sort
+                || (is_numeric_sort(left_sort) && is_numeric_sort(right_sort)) =>
+        {
             Term::Ne(Box::new(left), Box::new(right))
         }
-        BinaryOp::Gt if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Gt if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Gt(Box::new(left), Box::new(right))
         }
-        BinaryOp::Lt if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Lt if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Lt(Box::new(left), Box::new(right))
         }
-        BinaryOp::Gte if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Gte if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Ge(Box::new(left), Box::new(right))
         }
-        BinaryOp::Lte if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Lte if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Le(Box::new(left), Box::new(right))
         }
-        BinaryOp::Add if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Add if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Add(Box::new(left), Box::new(right))
         }
-        BinaryOp::Sub if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Sub if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Sub(Box::new(left), Box::new(right))
         }
-        BinaryOp::Mul if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOp::Mul if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Mul(Box::new(left), Box::new(right))
         }
         BinaryOp::Div => {
@@ -4174,38 +4998,46 @@ fn binary_term(operator: BinaryOperator, left: Term, right: Term) -> Result<Term
     let left_sort = left.sort();
     let right_sort = right.sort();
     Ok(match operator {
-        BinaryOperator::Equality | BinaryOperator::StrictEquality if left_sort == right_sort => {
+        BinaryOperator::Equality | BinaryOperator::StrictEquality
+            if left_sort == right_sort
+                || (is_numeric_sort(left_sort) && is_numeric_sort(right_sort)) =>
+        {
             Term::Eq(Box::new(left), Box::new(right))
         }
         BinaryOperator::Inequality | BinaryOperator::StrictInequality
-            if left_sort == right_sort =>
+            if left_sort == right_sort
+                || (is_numeric_sort(left_sort) && is_numeric_sort(right_sort)) =>
         {
             Term::Ne(Box::new(left), Box::new(right))
         }
-        BinaryOperator::GreaterThan if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOperator::GreaterThan
+            if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) =>
+        {
             Term::Gt(Box::new(left), Box::new(right))
         }
-        BinaryOperator::LessThan if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOperator::LessThan if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Lt(Box::new(left), Box::new(right))
         }
         BinaryOperator::GreaterEqualThan
-            if left_sort == Sort::Number && right_sort == Sort::Number =>
+            if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) =>
         {
             Term::Ge(Box::new(left), Box::new(right))
         }
         BinaryOperator::LessEqualThan
-            if left_sort == Sort::Number && right_sort == Sort::Number =>
+            if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) =>
         {
             Term::Le(Box::new(left), Box::new(right))
         }
-        BinaryOperator::Addition if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOperator::Addition if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) => {
             Term::Add(Box::new(left), Box::new(right))
         }
-        BinaryOperator::Subtraction if left_sort == Sort::Number && right_sort == Sort::Number => {
+        BinaryOperator::Subtraction
+            if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) =>
+        {
             Term::Sub(Box::new(left), Box::new(right))
         }
         BinaryOperator::Multiplication
-            if left_sort == Sort::Number && right_sort == Sort::Number =>
+            if is_numeric_sort(left_sort) && is_numeric_sort(right_sort) =>
         {
             Term::Mul(Box::new(left), Box::new(right))
         }
@@ -4275,6 +5107,7 @@ fn substitute(term: &Term, target: &Term, replacement: &Term) -> Term {
             Box::new(substitute(right, target, replacement)),
         ),
         Term::Not(inner) => Term::Not(Box::new(substitute(inner, target, replacement))),
+        Term::ToNumber(inner) => Term::ToNumber(Box::new(substitute(inner, target, replacement))),
         Term::Pred(name, argument) => Term::Pred(
             name.clone(),
             Box::new(substitute(argument, target, replacement)),
@@ -4313,10 +5146,21 @@ fn contains_term(term: &Term, needle: &Term) -> bool {
         | Term::Index(left, right, _) => {
             contains_term(left, needle) || contains_term(right, needle)
         }
-        Term::Not(inner) | Term::Pred(_, inner) | Term::Member(inner, _, _) => {
-            contains_term(inner, needle)
+        Term::Not(inner)
+        | Term::Pred(_, inner)
+        | Term::Member(inner, _, _)
+        | Term::ToNumber(inner) => contains_term(inner, needle),
+        Term::Number(_) | Term::Int(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => false,
+    }
+}
+
+fn fact_indexes_object(fact: &Term, object: &Term) -> bool {
+    match fact {
+        Term::Same(left, right) | Term::Eq(left, right) => {
+            matches!(left.as_ref(), Term::Index(found, _, _) if found.as_ref() == object)
+                || matches!(right.as_ref(), Term::Index(found, _, _) if found.as_ref() == object)
         }
-        Term::Number(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => false,
+        _ => false,
     }
 }
 
@@ -4335,8 +5179,10 @@ fn contains_heap_term(term: &Term) -> bool {
         | Term::Le(left, right)
         | Term::And(left, right)
         | Term::Or(left, right) => contains_heap_term(left) || contains_heap_term(right),
-        Term::Not(inner) | Term::Pred(_, inner) => contains_heap_term(inner),
-        Term::Number(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => false,
+        Term::Not(inner) | Term::Pred(_, inner) | Term::ToNumber(inner) => {
+            contains_heap_term(inner)
+        }
+        Term::Number(_) | Term::Int(_) | Term::Bool(_) | Term::String(_) | Term::Var(_, _) => false,
     }
 }
 
@@ -4351,6 +5197,8 @@ fn known_number_equality_in_term(term: &Term, target: &Term) -> Option<i64> {
         Term::Same(left, right) | Term::Eq(left, right) => match (&**left, &**right) {
             (left, Term::Number(value)) if left == target => Some(*value),
             (Term::Number(value), right) if right == target => Some(*value),
+            (left, Term::Int(value)) if left == target => Some(*value),
+            (Term::Int(value), right) if right == target => Some(*value),
             _ => None,
         },
         Term::And(left, right) => known_number_equality_in_term(left, target)
@@ -4372,9 +5220,20 @@ fn snapshot_heap_measure(state: &mut State, measure: &Term, snapshot: &Term) {
         .flat_map(split_conjuncts)
         .filter(|fact| !contains_heap_term(fact))
         .collect::<Vec<_>>();
+    let index_facts = match measure {
+        Term::Member(object, property, _) if property == "length" => state
+            .assumptions
+            .iter()
+            .cloned()
+            .flat_map(split_conjuncts)
+            .filter(|fact| fact_indexes_object(fact, object))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
 
     invalidate_heap_facts(state);
     state.assumptions.extend(snapshot_facts);
+    state.assumptions.extend(index_facts);
 }
 
 fn split_conjuncts(term: Term) -> Vec<Term> {
@@ -4936,15 +5795,17 @@ fn collect_variables(term: &Term, output: &mut std::collections::BTreeMap<String
             collect_variables(left, output);
             collect_variables(right, output);
         }
-        Term::Not(inner) | Term::Pred(_, inner) | Term::Member(inner, _, _) => {
-            collect_variables(inner, output)
-        }
-        Term::Number(_) | Term::Bool(_) | Term::String(_) => {}
+        Term::Not(inner)
+        | Term::Pred(_, inner)
+        | Term::Member(inner, _, _)
+        | Term::ToNumber(inner) => collect_variables(inner, output),
+        Term::Number(_) | Term::Int(_) | Term::Bool(_) | Term::String(_) => {}
     }
 }
 
 enum ZTerm {
     Number(Float),
+    Int(Z3Int),
     Bool(Bool),
     String(Z3String),
     Ref(Dynamic),
@@ -4953,11 +5814,18 @@ enum ZTerm {
 fn to_z3(term: &Term) -> Result<ZTerm, String> {
     match term {
         Term::Number(value) => Ok(ZTerm::Number(Float::from_f64(*value as f64))),
+        Term::Int(value) => Ok(ZTerm::Int(Z3Int::from_i64(*value))),
+        Term::ToNumber(inner) => match to_z3(inner)? {
+            ZTerm::Int(value) => int_to_number(&value),
+            ZTerm::Number(value) => Ok(ZTerm::Number(value)),
+            _ => Err("toNumber requires a logical integer".into()),
+        },
         Term::Bool(value) => Ok(ZTerm::Bool(Bool::from_bool(*value))),
         Term::String(value) => Z3String::from_str(value)
             .map(ZTerm::String)
             .map_err(|_| "String literal contains a null byte".into()),
         Term::Var(name, Sort::Number) => Ok(ZTerm::Number(Float::new_const_double(name.as_str()))),
+        Term::Var(name, Sort::Int) => Ok(ZTerm::Int(Z3Int::new_const(name.as_str()))),
         Term::Var(name, Sort::Bool) => Ok(ZTerm::Bool(Bool::new_const(name.as_str()))),
         Term::Var(name, Sort::String) => Ok(ZTerm::String(Z3String::new_const(name.as_str()))),
         Term::Var(name, Sort::Ref) => {
@@ -5020,6 +5888,14 @@ fn to_z3(term: &Term) -> Result<ZTerm, String> {
                     predicate.apply(&[&argument]).as_bool().unwrap(),
                 ))
             }
+            ZTerm::Int(argument) => {
+                let domain = Z3Sort::int();
+                let range = Z3Sort::bool();
+                let predicate = FuncDecl::new(name.as_str(), &[&domain], &range);
+                Ok(ZTerm::Bool(
+                    predicate.apply(&[&argument]).as_bool().unwrap(),
+                ))
+            }
             ZTerm::Ref(argument) => {
                 let domain = z3_sort(Sort::Ref);
                 let range = Z3Sort::bool();
@@ -5029,22 +5905,31 @@ fn to_z3(term: &Term) -> Result<ZTerm, String> {
                 ))
             }
         },
-        Term::Add(left, right) => number_pair(left, right, |a, b| {
-            a.add_with_rounding_mode(b, &RoundingMode::round_nearest_ties_to_even())
-        }),
-        Term::Sub(left, right) => number_pair(left, right, |a, b| {
-            a.sub_with_rounding_mode(b, &RoundingMode::round_nearest_ties_to_even())
-        }),
-        Term::Mul(left, right) => number_pair(left, right, |a, b| {
-            a.mul_with_rounding_mode(b, &RoundingMode::round_nearest_ties_to_even())
-        }),
+        Term::Add(left, right) => arithmetic_pair(
+            left,
+            right,
+            |a, b| a + b,
+            |a, b| a.add_with_rounding_mode(b, &RoundingMode::round_nearest_ties_to_even()),
+        ),
+        Term::Sub(left, right) => arithmetic_pair(
+            left,
+            right,
+            |a, b| a - b,
+            |a, b| a.sub_with_rounding_mode(b, &RoundingMode::round_nearest_ties_to_even()),
+        ),
+        Term::Mul(left, right) => arithmetic_pair(
+            left,
+            right,
+            |a, b| a * b,
+            |a, b| a.mul_with_rounding_mode(b, &RoundingMode::round_nearest_ties_to_even()),
+        ),
         Term::Same(left, right) => structural_equality(left, right),
         Term::Eq(left, right) => equality(left, right, false),
         Term::Ne(left, right) => equality(left, right, true),
-        Term::Gt(left, right) => number_compare(left, right, |a, b| a.gt(b)),
-        Term::Lt(left, right) => number_compare(left, right, |a, b| a.lt(b)),
-        Term::Ge(left, right) => number_compare(left, right, |a, b| a.ge(b)),
-        Term::Le(left, right) => number_compare(left, right, |a, b| a.le(b)),
+        Term::Gt(left, right) => ordered_compare(left, right, |a, b| a.gt(b), |a, b| a.gt(b)),
+        Term::Lt(left, right) => ordered_compare(left, right, |a, b| a.lt(b), |a, b| a.lt(b)),
+        Term::Ge(left, right) => ordered_compare(left, right, |a, b| a.ge(b), |a, b| a.ge(b)),
+        Term::Le(left, right) => ordered_compare(left, right, |a, b| a.le(b), |a, b| a.le(b)),
         Term::And(left, right) => bool_pair(left, right, |a, b| Bool::and(&[a, b])),
         Term::Or(left, right) => bool_pair(left, right, |a, b| Bool::or(&[a, b])),
         Term::Not(inner) => match to_z3(inner)? {
@@ -5057,6 +5942,7 @@ fn to_z3(term: &Term) -> Result<ZTerm, String> {
 fn sort_name(sort: Sort) -> &'static str {
     match sort {
         Sort::Number => "number",
+        Sort::Int => "int",
         Sort::Bool => "bool",
         Sort::String => "string",
         Sort::Ref => "ref",
@@ -5066,6 +5952,7 @@ fn sort_name(sort: Sort) -> &'static str {
 fn z3_sort(sort: Sort) -> Z3Sort {
     match sort {
         Sort::Number => Z3Sort::double(),
+        Sort::Int => Z3Sort::int(),
         Sort::Bool => Z3Sort::bool(),
         Sort::String => Z3Sort::string(),
         Sort::Ref => Z3Sort::uninterpreted(Symbol::String("Ref".into())),
@@ -5075,6 +5962,7 @@ fn z3_sort(sort: Sort) -> Z3Sort {
 fn zterm_dynamic(term: ZTerm) -> Dynamic {
     match term {
         ZTerm::Number(value) => Dynamic::from_ast(&value),
+        ZTerm::Int(value) => Dynamic::from_ast(&value),
         ZTerm::Bool(value) => Dynamic::from_ast(&value),
         ZTerm::String(value) => Dynamic::from_ast(&value),
         ZTerm::Ref(value) => value,
@@ -5087,6 +5975,10 @@ fn zterm_from_dynamic(term: Dynamic, sort: Sort) -> Result<ZTerm, String> {
             .as_float()
             .map(ZTerm::Number)
             .ok_or_else(|| "Member result is not a number".into()),
+        Sort::Int => term
+            .as_int()
+            .map(ZTerm::Int)
+            .ok_or_else(|| "Member result is not a logical integer".into()),
         Sort::Bool => term
             .as_bool()
             .map(ZTerm::Bool)
@@ -5099,6 +5991,465 @@ fn zterm_from_dynamic(term: Dynamic, sort: Sort) -> Result<ZTerm, String> {
     }
 }
 
+fn int_to_number(value: &Z3Int) -> Result<ZTerm, String> {
+    let domain = Z3Sort::int();
+    let range = Z3Sort::double();
+    let declaration = FuncDecl::new("__rt_int_to_number", &[&domain], &range);
+    let applied = declaration.apply(&[&Dynamic::from_ast(value)]);
+    applied
+        .as_float()
+        .map(ZTerm::Number)
+        .ok_or_else(|| "int-to-number conversion did not produce a float".into())
+}
+
+fn arithmetic_pair(
+    left: &Term,
+    right: &Term,
+    int_op: impl FnOnce(Z3Int, Z3Int) -> Z3Int,
+    float_op: impl FnOnce(Float, Float) -> Float,
+) -> Result<ZTerm, String> {
+    match (to_z3(left)?, to_z3(right)?) {
+        (ZTerm::Int(left), ZTerm::Int(right)) => Ok(ZTerm::Int(int_op(left, right))),
+        (left, right) => {
+            let left = zterm_as_number(left)?;
+            let right = zterm_as_number(right)?;
+            Ok(ZTerm::Number(float_op(left, right)))
+        }
+    }
+}
+
+fn ordered_compare(
+    left: &Term,
+    right: &Term,
+    int_op: impl FnOnce(&Z3Int, &Z3Int) -> Bool,
+    float_op: impl FnOnce(&Float, &Float) -> Bool,
+) -> Result<ZTerm, String> {
+    match (to_z3(left)?, to_z3(right)?) {
+        (ZTerm::Int(left), ZTerm::Int(right)) => Ok(ZTerm::Bool(int_op(&left, &right))),
+        (left, right) => {
+            let left = zterm_as_number(left)?;
+            let right = zterm_as_number(right)?;
+            Ok(ZTerm::Bool(float_op(&left, &right)))
+        }
+    }
+}
+
+fn zterm_as_number(term: ZTerm) -> Result<Float, String> {
+    match term {
+        ZTerm::Number(value) => Ok(value),
+        ZTerm::Int(value) => match int_to_number(&value)? {
+            ZTerm::Number(value) => Ok(value),
+            _ => Err("int-to-number conversion did not produce a float".into()),
+        },
+        _ => Err("Ordered comparison requires number or logical integer operands".into()),
+    }
+}
+
+#[allow(dead_code)]
+fn as_number_term(term: &Term) -> Term {
+    match term.sort() {
+        Sort::Number => term.clone(),
+        Sort::Int => match term {
+            Term::Int(value) => Term::Number(*value),
+            _ => Term::ToNumber(Box::new(term.clone())),
+        },
+        _ => term.clone(),
+    }
+}
+
+fn as_int_term(term: &Term) -> Option<Term> {
+    match term {
+        Term::Int(_) => Some(term.clone()),
+        Term::Number(value) => Some(Term::Int(*value)),
+        Term::Var(_, Sort::Int)
+        | Term::Member(_, _, Sort::Int)
+        | Term::Index(_, _, Sort::Int)
+        | Term::Add(_, _)
+        | Term::Sub(_, _)
+        | Term::Mul(_, _)
+            if term.sort() == Sort::Int =>
+        {
+            Some(term.clone())
+        }
+        _ => None,
+    }
+}
+
+fn collection_length(term: &Term) -> Term {
+    Term::Member(Box::new(term.clone()), "length".into(), Sort::Int)
+}
+
+fn is_dense_array(base: &BaseType) -> bool {
+    matches!(base, BaseType::Generic(name, arguments) if name == "DenseArray" && arguments.len() == 1)
+}
+
+fn is_boolean_base(base: &BaseType) -> bool {
+    matches!(base, BaseType::Primitive(name) if name == "boolean")
+}
+
+fn sort_for_indexed_type(ty: &RefinementType) -> Sort {
+    if ty.index.is_some() {
+        match &ty.base {
+            BaseType::Primitive(name) if name == "number" => Sort::Int,
+            BaseType::Primitive(name) if name == "boolean" => Sort::Bool,
+            _ => sort_for_base(&ty.base),
+        }
+    } else {
+        sort_for_base(&ty.base)
+    }
+}
+
+fn index_formula(value: &Value, index_term: &Term) -> Term {
+    if is_dense_array(&value.base) {
+        let length = collection_length(&value.term);
+        let expected = as_int_term(index_term).unwrap_or_else(|| index_term.clone());
+        Term::Eq(Box::new(length), Box::new(expected))
+    } else if is_boolean_base(&value.base) && *index_term == Term::Bool(true) {
+        value.term.clone()
+    } else if is_boolean_base(&value.base) && *index_term == Term::Bool(false) {
+        Term::Not(Box::new(value.term.clone()))
+    } else {
+        Term::Eq(Box::new(value.term.clone()), Box::new(index_term.clone()))
+    }
+}
+
+fn int_bound_term(state: &State, name: &str) -> Option<Term> {
+    state
+        .env
+        .get(name)
+        .map(|value| value.term.clone())
+        .or_else(|| state.entry_params.get(name).cloned())
+        .filter(|term| term.sort() == Sort::Int)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LoopCandidate {
+    ZeroLe(String),
+    OneLe(String),
+    LtLength {
+        index: String,
+        array: String,
+    },
+    LeLength {
+        index: String,
+        array: String,
+    },
+    LeOther {
+        left: String,
+        right: String,
+    },
+    EqOther {
+        left: String,
+        right: String,
+    },
+    EqDiff {
+        left: String,
+        right: String,
+        minus: String,
+    },
+    Post {
+        name: String,
+        predicate: PredicateExpr,
+    },
+}
+
+impl LoopCandidate {
+    fn instantiate(&self, state: &State) -> Option<Term> {
+        match self {
+            Self::ZeroLe(name) => {
+                let value = state.env.get(name)?;
+                Some(Term::Le(
+                    Box::new(zero_for(&value.term)),
+                    Box::new(value.term.clone()),
+                ))
+            }
+            Self::OneLe(name) => {
+                let value = state.env.get(name)?;
+                Some(Term::Le(
+                    Box::new(one_for(&value.term)),
+                    Box::new(value.term.clone()),
+                ))
+            }
+            Self::LtLength { index, array } => {
+                let index = state.env.get(index)?;
+                let array = state.env.get(array)?;
+                Some(Term::Lt(
+                    Box::new(index.term.clone()),
+                    Box::new(collection_length(&array.term)),
+                ))
+            }
+            Self::LeLength { index, array } => {
+                let index = state.env.get(index)?;
+                let array = state.env.get(array)?;
+                Some(Term::Le(
+                    Box::new(index.term.clone()),
+                    Box::new(collection_length(&array.term)),
+                ))
+            }
+            Self::LeOther { left, right } => {
+                let left = state.env.get(left)?;
+                let right = state
+                    .env
+                    .get(right)
+                    .map(|value| value.term.clone())
+                    .or_else(|| state.entry_params.get(right).cloned())?;
+                Some(Term::Le(Box::new(left.term.clone()), Box::new(right)))
+            }
+            Self::EqOther { left, right } => {
+                let left = state.env.get(left)?;
+                let right = int_bound_term(state, right)?;
+                if left.term.sort() != Sort::Int || right.sort() != Sort::Int {
+                    return None;
+                }
+                Some(Term::Eq(Box::new(left.term.clone()), Box::new(right)))
+            }
+            Self::EqDiff { left, right, minus } => {
+                let left = state.env.get(left)?;
+                let right = int_bound_term(state, right)?;
+                let minus = int_bound_term(state, minus)?;
+                if left.term.sort() != Sort::Int {
+                    return None;
+                }
+                Some(Term::Eq(
+                    Box::new(left.term.clone()),
+                    Box::new(Term::Sub(Box::new(right), Box::new(minus))),
+                ))
+            }
+            Self::Post { name, predicate } => {
+                let value = state.env.get(name)?;
+                let replacements = HashMap::from([
+                    ("$".to_string(), value.term.clone()),
+                    (name.clone(), value.term.clone()),
+                ]);
+                predicate_term(
+                    predicate,
+                    &replacements,
+                    &HashMap::new(),
+                    Some(value.term.sort()),
+                )
+                .ok()
+            }
+        }
+    }
+}
+
+fn zero_for(term: &Term) -> Term {
+    if term.sort() == Sort::Int {
+        Term::Int(0)
+    } else {
+        Term::Number(0)
+    }
+}
+
+fn one_for(term: &Term) -> Term {
+    if term.sort() == Sort::Int {
+        Term::Int(1)
+    } else {
+        Term::Number(1)
+    }
+}
+
+fn index_names_in_contract(contract: &Contract) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for (_, ty) in &contract.params {
+        collect_ident_names(ty.index.as_ref(), &mut names);
+    }
+    collect_ident_names(contract.ret.index.as_ref(), &mut names);
+    names.remove("$");
+    names
+}
+
+fn collect_ident_names(predicate: Option<&PredicateExpr>, names: &mut HashSet<String>) {
+    let Some(predicate) = predicate else {
+        return;
+    };
+    match predicate {
+        PredicateExpr::Identifier(name) => {
+            names.insert(name.clone());
+        }
+        PredicateExpr::Return => {
+            names.insert("$".into());
+        }
+        PredicateExpr::Member(object, _)
+        | PredicateExpr::Not(object)
+        | PredicateExpr::PredicateApply(_, object) => collect_ident_names(Some(object), names),
+        PredicateExpr::Binary(_, left, right) | PredicateExpr::Logical(_, left, right) => {
+            collect_ident_names(Some(left), names);
+            collect_ident_names(Some(right), names);
+        }
+        PredicateExpr::Literal(_) => {}
+    }
+}
+
+fn scrape_loop_candidates(
+    states: &[State],
+    assigned: &HashSet<String>,
+    current_function: Option<(&str, &Contract)>,
+) -> Vec<LoopCandidate> {
+    let mut candidates = Vec::new();
+    for state in states {
+        let arrays = state
+            .env
+            .iter()
+            .filter(|(_, value)| is_dense_array(&value.base))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let int_bounds = state
+            .env
+            .iter()
+            .filter(|(_, value)| value.term.sort() == Sort::Int)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in assigned {
+            let Some(value) = state.env.get(name) else {
+                continue;
+            };
+            if !is_numeric_sort(value.term.sort()) {
+                continue;
+            }
+            candidates.push(LoopCandidate::ZeroLe(name.clone()));
+            candidates.push(LoopCandidate::OneLe(name.clone()));
+            for array in &arrays {
+                candidates.push(LoopCandidate::LtLength {
+                    index: name.clone(),
+                    array: array.clone(),
+                });
+                candidates.push(LoopCandidate::LeLength {
+                    index: name.clone(),
+                    array: array.clone(),
+                });
+            }
+            if value.term.sort() == Sort::Int {
+                for bound in &int_bounds {
+                    if bound != name {
+                        candidates.push(LoopCandidate::LeOther {
+                            left: name.clone(),
+                            right: bound.clone(),
+                        });
+                        candidates.push(LoopCandidate::EqOther {
+                            left: name.clone(),
+                            right: bound.clone(),
+                        });
+                    }
+                }
+                let unassigned_ints = int_bounds
+                    .iter()
+                    .filter(|bound| !assigned.contains(*bound))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for right in assigned {
+                    if right == name {
+                        continue;
+                    }
+                    let Some(right_value) = state.env.get(right) else {
+                        continue;
+                    };
+                    if right_value.term.sort() != Sort::Int {
+                        continue;
+                    }
+                    for minus in &unassigned_ints {
+                        candidates.push(LoopCandidate::EqDiff {
+                            left: name.clone(),
+                            right: right.clone(),
+                            minus: minus.clone(),
+                        });
+                    }
+                }
+            }
+            if let Some((_, contract)) = current_function
+                && let Some(predicate) = &contract.ret.predicate
+                && is_numeric_sort(value.term.sort())
+                && is_numeric_sort(sort_for_base(&contract.ret.base))
+            {
+                candidates.push(LoopCandidate::Post {
+                    name: name.clone(),
+                    predicate: predicate.clone(),
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+    candidates.dedup();
+    candidates
+}
+
+fn assigned_names_in_statement(statement: &Statement<'_>) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_assigned_statement(statement, &mut names);
+    names
+}
+
+fn assigned_names_in_expression(expression: &Expression<'_>) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_assigned_expression(expression, &mut names);
+    names
+}
+
+fn collect_assigned_statement(statement: &Statement<'_>, names: &mut HashSet<String>) {
+    match statement {
+        Statement::BlockStatement(block) => {
+            for statement in &block.body {
+                collect_assigned_statement(statement, names);
+            }
+        }
+        Statement::IfStatement(if_statement) => {
+            collect_assigned_statement(&if_statement.consequent, names);
+            if let Some(alternate) = &if_statement.alternate {
+                collect_assigned_statement(alternate, names);
+            }
+        }
+        Statement::WhileStatement(while_statement) => {
+            collect_assigned_statement(&while_statement.body, names);
+        }
+        Statement::ForStatement(for_statement) => {
+            collect_assigned_statement(&for_statement.body, names);
+            if let Some(update) = &for_statement.update {
+                collect_assigned_expression(update, names);
+            }
+        }
+        Statement::ExpressionStatement(expression) => {
+            collect_assigned_expression(&expression.expression, names);
+        }
+        Statement::VariableDeclaration(declaration) => {
+            for declarator in &declaration.declarations {
+                if let BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                    names.insert(identifier.name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_assigned_expression(expression: &Expression<'_>, names: &mut HashSet<String>) {
+    match expression {
+        Expression::AssignmentExpression(assignment) => {
+            if let Some(SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier)) =
+                assignment.left.as_simple_assignment_target()
+            {
+                names.insert(identifier.name.to_string());
+            }
+            collect_assigned_expression(&assignment.right, names);
+        }
+        Expression::UpdateExpression(update) => {
+            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) = &update.argument
+            {
+                names.insert(identifier.name.to_string());
+            }
+        }
+        Expression::SequenceExpression(sequence) => {
+            for expression in &sequence.expressions {
+                collect_assigned_expression(expression, names);
+            }
+        }
+        Expression::ParenthesizedExpression(parenthesized) => {
+            collect_assigned_expression(&parenthesized.expression, names);
+        }
+        _ => {}
+    }
+}
+
+#[allow(dead_code)]
 fn number_pair(
     left: &Term,
     right: &Term,
@@ -5110,6 +6461,7 @@ fn number_pair(
     }
 }
 
+#[allow(dead_code)]
 fn number_compare(
     left: &Term,
     right: &Term,
@@ -5133,11 +6485,27 @@ fn bool_pair(
 }
 
 fn equality(left: &Term, right: &Term, negate: bool) -> Result<ZTerm, String> {
+    if left == right && left.sort() == Sort::Number {
+        let ZTerm::Number(value) = to_z3(left)? else {
+            return Err("Equality operands have different base types".into());
+        };
+        let equality = value.is_nan().not();
+        return Ok(ZTerm::Bool(if negate { equality.not() } else { equality }));
+    }
     let equality = match (to_z3(left)?, to_z3(right)?) {
         (ZTerm::Number(left), ZTerm::Number(right)) => left.eq_fpa(right),
-        (ZTerm::Bool(left), ZTerm::Bool(right)) => left.eq(right),
-        (ZTerm::String(left), ZTerm::String(right)) => left.eq(right),
-        (ZTerm::Ref(left), ZTerm::Ref(right)) => left.eq(right),
+        (ZTerm::Int(left), ZTerm::Int(right)) => left.eq(&right),
+        (ZTerm::Int(left), ZTerm::Number(right)) => match int_to_number(&left)? {
+            ZTerm::Number(left) => left.eq_fpa(right),
+            _ => return Err("Equality operands have different base types".into()),
+        },
+        (ZTerm::Number(left), ZTerm::Int(right)) => match int_to_number(&right)? {
+            ZTerm::Number(right) => left.eq_fpa(right),
+            _ => return Err("Equality operands have different base types".into()),
+        },
+        (ZTerm::Bool(left), ZTerm::Bool(right)) => left.eq(&right),
+        (ZTerm::String(left), ZTerm::String(right)) => left.eq(&right),
+        (ZTerm::Ref(left), ZTerm::Ref(right)) => left.eq(&right),
         _ => return Err("Equality operands have different base types".into()),
     };
     Ok(ZTerm::Bool(if negate { equality.not() } else { equality }))
@@ -5145,10 +6513,19 @@ fn equality(left: &Term, right: &Term, negate: bool) -> Result<ZTerm, String> {
 
 fn structural_equality(left: &Term, right: &Term) -> Result<ZTerm, String> {
     let equality = match (to_z3(left)?, to_z3(right)?) {
-        (ZTerm::Number(left), ZTerm::Number(right)) => left.eq(right),
-        (ZTerm::Bool(left), ZTerm::Bool(right)) => left.eq(right),
-        (ZTerm::String(left), ZTerm::String(right)) => left.eq(right),
-        (ZTerm::Ref(left), ZTerm::Ref(right)) => left.eq(right),
+        (ZTerm::Number(left), ZTerm::Number(right)) => left.eq(&right),
+        (ZTerm::Int(left), ZTerm::Int(right)) => left.eq(&right),
+        (ZTerm::Int(left), ZTerm::Number(right)) => match int_to_number(&left)? {
+            ZTerm::Number(left) => left.eq(&right),
+            _ => return Err("SSA equality operands have different base types".into()),
+        },
+        (ZTerm::Number(left), ZTerm::Int(right)) => match int_to_number(&right)? {
+            ZTerm::Number(right) => left.eq(&right),
+            _ => return Err("SSA equality operands have different base types".into()),
+        },
+        (ZTerm::Bool(left), ZTerm::Bool(right)) => left.eq(&right),
+        (ZTerm::String(left), ZTerm::String(right)) => left.eq(&right),
+        (ZTerm::Ref(left), ZTerm::Ref(right)) => left.eq(&right),
         _ => return Err("SSA equality operands have different base types".into()),
     };
     Ok(ZTerm::Bool(equality))
@@ -5315,8 +6692,11 @@ fn known_index_base(base: &BaseType) -> Option<BaseType> {
 fn receiver_type_names(base: &BaseType) -> Vec<String> {
     match base {
         BaseType::Array(_) => vec!["Array".into()],
-        BaseType::Generic(name, _) if matches!(name.as_str(), "DenseArray" | "ReadonlyArray") => {
-            vec!["Array".into()]
+        BaseType::Generic(name, _) if name == "DenseArray" => {
+            vec!["DenseArray".into(), "Array".into()]
+        }
+        BaseType::Generic(name, _) if name == "ReadonlyArray" => {
+            vec!["ReadonlyArray".into(), "Array".into()]
         }
         BaseType::Generic(name, _) | BaseType::Named(name) => vec![name.clone()],
         BaseType::Primitive(name) if name == "string" => vec!["String".into()],
@@ -5435,15 +6815,12 @@ fn intrinsic_refinements(base: &BaseType, value: &Term) -> Vec<Term> {
     if !has_length {
         return Vec::new();
     }
-    let length = Term::Member(Box::new(value.clone()), "length".into(), Sort::Number);
-    let mut refinements = vec![Term::Ge(
-        Box::new(length.clone()),
-        Box::new(Term::Number(0)),
-    )];
+    let length = collection_length(value);
+    let mut refinements = vec![Term::Ge(Box::new(length.clone()), Box::new(Term::Int(0)))];
     if !matches!(base, BaseType::Primitive(name) if name == "string") {
         refinements.push(Term::Le(
             Box::new(length),
-            Box::new(Term::Number(4_294_967_295)),
+            Box::new(Term::Int(4_294_967_295)),
         ));
     }
     refinements
@@ -5644,13 +7021,14 @@ fn instantiate_refinement(
 ) -> RefinementType {
     RefinementType {
         base: instantiate_base(&refinement.base, bindings),
+        index: refinement.index.clone(),
         predicate: refinement.predicate.clone(),
     }
 }
 
 fn base_for_sort(sort: Sort) -> BaseType {
     match sort {
-        Sort::Number => number_type(),
+        Sort::Number | Sort::Int => number_type(),
         Sort::Bool => boolean_type(),
         Sort::String => BaseType::Primitive("string".into()),
         Sort::Ref => BaseType::Primitive("unknown".into()),
@@ -5681,4 +7059,26 @@ fn boolean_type() -> BaseType {
 
 fn is_void(base: &BaseType) -> bool {
     matches!(base, BaseType::Primitive(name) if name == "void")
+}
+
+#[cfg(test)]
+mod ieee_equality_tests {
+    use super::*;
+
+    #[test]
+    fn number_self_equality_is_not_a_proof() {
+        let x = Term::Var("x".into(), Sort::Number);
+        let self_eq = Term::Eq(Box::new(x.clone()), Box::new(x.clone()));
+        let is_true = Term::Eq(Box::new(self_eq), Box::new(Term::Bool(true)));
+        let constraint = FixpointConstraint {
+            assumptions: &[],
+            consequent: &is_true,
+        };
+        let result = solve_constraint(&constraint).expect("solver should run");
+        assert_ne!(
+            result,
+            SatResult::Unsat,
+            "x === x must not prove true for all JS numbers (NaN)"
+        );
+    }
 }

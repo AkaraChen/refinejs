@@ -103,6 +103,10 @@ pub enum SemanticRefinement {
     },
     ResultElementsSubsetOfReceiver,
     ReceiverLengthIncreasesByArgumentCount,
+    /// Dense-array `pop`: the receiver must have a positive length index.
+    RequiresPositiveReceiverLength,
+    /// Dense-array `pop`: length becomes `n - 1` after the call.
+    ReceiverLengthDecreasesByOne,
     /// Every reference argument may become reachable through the receiver.
     ReceiverMayContainArguments,
 }

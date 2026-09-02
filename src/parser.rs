@@ -19,6 +19,8 @@ enum TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
     Dot,
     Eof,
@@ -91,7 +93,7 @@ impl<'a> Lexer<'a> {
                     .map(|c| c.is_ascii_digit())
                     .unwrap_or(false))
         {
-            return Ok(Some(self.read_number()));
+            return Ok(Some(self.read_number()?));
         }
 
         if ch == '_' || ch.is_alphabetic() || ch == '$' {
@@ -216,6 +218,16 @@ impl<'a> Lexer<'a> {
                 value: ch.to_string(),
                 _pos: start,
             })),
+            '[' => Ok(Some(Token {
+                kind: TokenKind::LBracket,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            ']' => Ok(Some(Token {
+                kind: TokenKind::RBracket,
+                value: ch.to_string(),
+                _pos: start,
+            })),
             ',' => Ok(Some(Token {
                 kind: TokenKind::Comma,
                 value: ch.to_string(),
@@ -278,8 +290,45 @@ impl<'a> Lexer<'a> {
         Err("Unterminated string".into())
     }
 
-    fn read_number(&mut self) -> Token {
+    fn read_number(&mut self) -> Result<Token, String> {
         let start = self.pos;
+        let rest = &self.src[start..];
+        if rest.len() >= 2 {
+            let prefix: String = rest
+                .chars()
+                .take(2)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if prefix == "0x" || prefix == "0o" || prefix == "0b" {
+                self.pos += 2;
+                let digits_start = self.pos;
+                while self.pos < self.src.len() {
+                    let ch = self.src[self.pos..].chars().next().unwrap();
+                    let ok = match prefix.as_str() {
+                        "0x" => ch.is_ascii_hexdigit(),
+                        "0o" => ('0'..='7').contains(&ch),
+                        "0b" => ch == '0' || ch == '1',
+                        _ => false,
+                    };
+                    if ok {
+                        self.pos += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if self.pos == digits_start {
+                    return Err(format!(
+                        "Invalid numeric literal '{}'",
+                        &self.src[start..self.pos]
+                    ));
+                }
+                return Ok(Token {
+                    kind: TokenKind::Number,
+                    value: self.src[start..self.pos].into(),
+                    _pos: start,
+                });
+            }
+        }
         while self.pos < self.src.len() {
             let ch = self.src[self.pos..].chars().next().unwrap();
             if ch.is_ascii_digit() || ch == '.' {
@@ -288,11 +337,11 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Token {
+        Ok(Token {
             kind: TokenKind::Number,
             value: self.src[start..self.pos].into(),
             _pos: start,
-        }
+        })
     }
 
     fn read_ident(&mut self) -> Token {
@@ -310,6 +359,25 @@ impl<'a> Lexer<'a> {
             value: self.src[start..self.pos].into(),
             _pos: start,
         }
+    }
+}
+
+fn parse_predicate_number(text: &str) -> Result<f64, String> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(digits) = lower.strip_prefix("0x") {
+        i64::from_str_radix(digits, 16)
+            .map(|value| value as f64)
+            .map_err(|_| format!("Invalid number {text}"))
+    } else if let Some(digits) = lower.strip_prefix("0o") {
+        i64::from_str_radix(digits, 8)
+            .map(|value| value as f64)
+            .map_err(|_| format!("Invalid number {text}"))
+    } else if let Some(digits) = lower.strip_prefix("0b") {
+        i64::from_str_radix(digits, 2)
+            .map(|value| value as f64)
+            .map_err(|_| format!("Invalid number {text}"))
+    } else {
+        text.parse().map_err(|_| format!("Invalid number {text}"))
     }
 }
 
@@ -354,19 +422,25 @@ impl TypeParser {
 
     fn parse_refined_type(&mut self) -> Result<RefinementType, String> {
         let base = self.parse_base_type()?;
-        if self.peek().kind == TokenKind::Pipe {
+        let index = if self.peek().kind == TokenKind::LBracket {
             self.pos += 1;
-            let predicate = self.parse_predicate()?;
-            Ok(RefinementType {
-                base,
-                predicate: Some(predicate),
-            })
+            let index = self.parse_predicate()?;
+            self.expect(TokenKind::RBracket)?;
+            Some(index)
         } else {
-            Ok(RefinementType {
-                base,
-                predicate: None,
-            })
-        }
+            None
+        };
+        let predicate = if self.peek().kind == TokenKind::Pipe {
+            self.pos += 1;
+            Some(self.parse_predicate()?)
+        } else {
+            None
+        };
+        Ok(RefinementType {
+            base,
+            index,
+            predicate,
+        })
     }
 
     fn parse_base_type(&mut self) -> Result<BaseType, String> {
@@ -525,10 +599,7 @@ impl TypeParser {
         match tok.kind {
             TokenKind::Number => {
                 self.pos += 1;
-                let v: f64 = tok
-                    .value
-                    .parse()
-                    .map_err(|_| format!("Invalid number {}", tok.value))?;
+                let v = parse_predicate_number(&tok.value)?;
                 Ok(PredicateExpr::Literal(Literal::Number(v)))
             }
             TokenKind::String => {
