@@ -1,26 +1,21 @@
 use crate::syntax::*;
-use oxc_allocator::Allocator;
-use oxc_ast::ast::{BindingPattern, Expression, FormalParameter, Function, Program, ReturnStatement, Statement, VariableDeclaration};
-use oxc_ast_visit::Visit;
+use oxc_allocator::{Allocator, ArenaVec};
+use oxc_ast::ast::*;
+use oxc_ast::builder::AstBuilder;
+use oxc_ast_visit::VisitMut;
+use oxc_codegen::Codegen;
 use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType, Span};
+use oxc_span::{SourceType, SPAN};
 use std::collections::HashMap;
 
 const RUNTIME_IDENT: &str = "__rt";
 const RETURN_TEMP: &str = "__rt_return";
 const VALUE_TEMP: &str = "__rt_v";
 
-#[derive(Debug, Clone)]
-struct Replacement {
-    start: usize,
-    end: usize,
-    text: String,
-}
-
 pub fn transpile(source: &str, annotations: &[Annotation]) -> Result<String, String> {
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_module(true);
-    let ret = Parser::new(&allocator, source, source_type)
+    let mut ret = Parser::new(&allocator, source, source_type)
         .with_options(oxc_parser::ParseOptions::default())
         .parse();
 
@@ -28,35 +23,29 @@ pub fn transpile(source: &str, annotations: &[Annotation]) -> Result<String, Str
         return Err(format!("Parse errors: {:?}", ret.diagnostics));
     }
 
-    let mut collector = TranspileCollector::new(source, annotations);
-    collector.visit_program(&ret.program);
+    let mut visitor = TranspilerVisitor::new(&allocator, annotations);
+    visitor.visit_program(&mut ret.program);
 
-    // Sort replacements by start descending so positions remain valid.
-    collector.replacements.sort_by(|a, b| b.start.cmp(&a.start));
-
-    let mut result = source.to_string();
-    for repl in collector.replacements {
-        result.replace_range(repl.start..repl.end, &repl.text);
-    }
-
-    Ok(result)
+    let code = Codegen::new().build(&ret.program).code;
+    Ok(code)
 }
 
-struct TranspileCollector<'s> {
-    source: &'s str,
-    by_function: HashMap<String, Vec<&'s Annotation>>,
-    by_variable: HashMap<String, Vec<&'s Annotation>>,
+struct TranspilerVisitor<'a> {
+    allocator: &'a Allocator,
+    builder: AstBuilder<'a>,
+    by_function: HashMap<String, Vec<&'a Annotation>>,
+    by_variable: HashMap<String, Vec<&'a Annotation>>,
     current_function: Vec<String>,
-    replacements: Vec<Replacement>,
 }
 
-impl<'s> TranspileCollector<'s> {
-    fn new(source: &'s str, annotations: &'s [Annotation]) -> Self {
+impl<'a> TranspilerVisitor<'a> {
+    fn new(allocator: &'a Allocator, annotations: &'a [Annotation]) -> Self {
         let mut by_function: HashMap<String, Vec<&Annotation>> = HashMap::new();
         let mut by_variable: HashMap<String, Vec<&Annotation>> = HashMap::new();
         for a in annotations {
             match &a.target {
-                AnnotationTarget::Param { function_name, .. } | AnnotationTarget::Return { function_name } => {
+                AnnotationTarget::Param { function_name, .. }
+                | AnnotationTarget::Return { function_name } => {
                     by_function.entry(function_name.clone()).or_default().push(a);
                 }
                 AnnotationTarget::Variable { name } => {
@@ -65,16 +54,19 @@ impl<'s> TranspileCollector<'s> {
             }
         }
         Self {
-            source,
+            allocator,
+            builder: AstBuilder::new(allocator),
             by_function,
             by_variable,
             current_function: Vec::new(),
-            replacements: Vec::new(),
         }
     }
 
     fn function_name(func: &Function) -> String {
-        func.id.as_ref().map(|id| id.name.to_string()).unwrap_or_else(|| "<anonymous>".into())
+        func.id
+            .as_ref()
+            .map(|id| id.name.to_string())
+            .unwrap_or_else(|| "<anonymous>".into())
     }
 
     fn param_name(param: &FormalParameter) -> Option<String> {
@@ -88,54 +80,76 @@ impl<'s> TranspileCollector<'s> {
         }
     }
 
-    fn source_text(&self, span: Span) -> &str {
-        &self.source[span.start as usize..span.end as usize]
+    fn alloc_str(&self, s: &str) -> &'a str {
+        self.allocator.alloc_str(s)
     }
 
-    fn predicate_to_js(&self, pred: &PredicateExpr, self_name: &str) -> String {
+    fn ident(&self, name: &str) -> Expression<'a> {
+        let name = self.alloc_str(name);
+        Expression::new_identifier(SPAN, name, &self.builder)
+    }
+
+    fn string_literal(&self, value: &str) -> Expression<'a> {
+        let value = self.alloc_str(value);
+        Expression::new_string_literal(SPAN, value, None::<Str>, &self.builder)
+    }
+
+    fn numeric_literal(&self, value: f64) -> Expression<'a> {
+        Expression::new_numeric_literal(SPAN, value, None::<Str>, NumberBase::Decimal, &self.builder)
+    }
+
+    fn boolean_literal(&self, value: bool) -> Expression<'a> {
+        Expression::new_boolean_literal(SPAN, value, &self.builder)
+    }
+
+    fn member_expr(&self, object: &str, property: &str) -> Expression<'a> {
+        let obj = self.ident(object);
+        let property = self.alloc_str(property);
+        let prop = IdentifierName::new(SPAN, property, &self.builder);
+        Expression::new_static_member_expression(SPAN, obj, prop, false, &self.builder)
+    }
+
+    fn predicate_to_expr(&self, pred: &PredicateExpr, self_name: &str) -> Expression<'a> {
         match pred {
             PredicateExpr::Literal(lit) => match lit {
-                Literal::Number(n) => n.to_string(),
-                Literal::String(s) => format!("\"{}\"", s),
-                Literal::Boolean(b) => b.to_string(),
+                Literal::Number(n) => self.numeric_literal(*n),
+                Literal::String(s) => self.string_literal(s),
+                Literal::Boolean(b) => self.boolean_literal(*b),
             },
-            PredicateExpr::Identifier(name) => name.clone(),
-            PredicateExpr::Member(obj, prop) => format!("{}.{}", obj, prop),
-            PredicateExpr::Return => RETURN_TEMP.to_string(),
-            PredicateExpr::Not(expr) => format!("!({})", self.predicate_to_js(expr, self_name)),
+            PredicateExpr::Identifier(name) => self.ident(name),
+            PredicateExpr::Member(obj, prop) => self.member_expr(obj, prop),
+            PredicateExpr::Return => self.ident(RETURN_TEMP),
+            PredicateExpr::Not(expr) => {
+                let arg = self.predicate_to_expr(expr, self_name);
+                Expression::new_unary_expression(SPAN, UnaryOperator::LogicalNot, arg, &self.builder)
+            }
             PredicateExpr::Logical(op, left, right) => {
-                let op_str = match op {
-                    LogicalOp::And => "&&",
-                    LogicalOp::Or => "||",
+                let op = match op {
+                    LogicalOp::And => LogicalOperator::And,
+                    LogicalOp::Or => LogicalOperator::Or,
                 };
-                format!(
-                    "({} {} {})",
-                    self.predicate_to_js(left, self_name),
-                    op_str,
-                    self.predicate_to_js(right, self_name)
-                )
+                let left = self.predicate_to_expr(left, self_name);
+                let right = self.predicate_to_expr(right, self_name);
+                Expression::new_logical_expression(SPAN, left, op, right, &self.builder)
             }
             PredicateExpr::Binary(op, left, right) => {
-                let op_str = match op {
-                    BinaryOp::EqEqEq => "===",
-                    BinaryOp::NotEqEq => "!==",
-                    BinaryOp::EqEq => "==",
-                    BinaryOp::NotEq => "!=",
-                    BinaryOp::Gt => ">",
-                    BinaryOp::Lt => "<",
-                    BinaryOp::Gte => ">=",
-                    BinaryOp::Lte => "<=",
-                    BinaryOp::Add => "+",
-                    BinaryOp::Sub => "-",
-                    BinaryOp::Mul => "*",
-                    BinaryOp::Div => "/",
+                let op = match op {
+                    BinaryOp::EqEqEq => BinaryOperator::StrictEquality,
+                    BinaryOp::NotEqEq => BinaryOperator::StrictInequality,
+                    BinaryOp::EqEq => BinaryOperator::Equality,
+                    BinaryOp::NotEq => BinaryOperator::Inequality,
+                    BinaryOp::Gt => BinaryOperator::GreaterThan,
+                    BinaryOp::Lt => BinaryOperator::LessThan,
+                    BinaryOp::Gte => BinaryOperator::GreaterEqualThan,
+                    BinaryOp::Lte => BinaryOperator::LessEqualThan,
+                    BinaryOp::Add => BinaryOperator::Addition,
+                    BinaryOp::Sub => BinaryOperator::Subtraction,
+                    BinaryOp::Mul => BinaryOperator::Multiplication,
+                    BinaryOp::Div => BinaryOperator::Division,
                 };
-                format!(
-                    "({} {} {})",
-                    self.predicate_to_js(left, self_name),
-                    op_str,
-                    self.predicate_to_js(right, self_name)
-                )
+                let left = self.predicate_to_expr(left, self_name);
+                let right = self.predicate_to_expr(right, self_name);
+                Expression::new_binary_expression(SPAN, left, op, right, &self.builder)
             }
         }
     }
@@ -188,147 +202,299 @@ impl<'s> TranspileCollector<'s> {
         }
     }
 
-    fn build_param_assert(&self, function_name: &str, param_name: &str, predicate: &PredicateExpr) -> String {
-        let expr = self.predicate_to_js(predicate, param_name);
+    fn build_assert_call(
+        &self,
+        predicate: &PredicateExpr,
+        message: &str,
+        ctx_key: &str,
+        ctx_value_name: &str,
+    ) -> Expression<'a> {
+        let ctx_key = self.alloc_str(ctx_key);
+        let callee = self.member_expr(RUNTIME_IDENT, "assert");
+        let cond = self.predicate_to_expr(predicate, ctx_value_name);
+        let msg = self.string_literal(message);
+
+        let ctx_key_ident = PropertyKey::StaticIdentifier(IdentifierName::boxed(
+            SPAN,
+            ctx_key,
+            &self.builder,
+        ));
+        let ctx_value = self.ident(ctx_value_name);
+        let prop = ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
+            SPAN,
+            PropertyKind::Init,
+            ctx_key_ident,
+            ctx_value,
+            false,
+            false,
+            false,
+            &self.builder,
+        ));
+        let ctx = Expression::new_object_expression(
+            SPAN,
+            ArenaVec::from_array_in([prop], &self.builder),
+            &self.builder,
+        );
+
+        let args = ArenaVec::from_array_in(
+            [
+                Argument::from(cond),
+                Argument::from(msg),
+                Argument::from(ctx),
+            ],
+            &self.builder,
+        );
+
+        Expression::new_call_expression(SPAN, callee, None, args, false, &self.builder)
+    }
+
+    fn build_param_assert(
+        &self,
+        function_name: &str,
+        param_name: &str,
+        predicate: &PredicateExpr,
+    ) -> Statement<'a> {
         let msg = format!(
             "{} parameter '{}' violates refinement: {}",
             function_name,
             param_name,
             self.predicate_to_string(predicate)
         );
-        format!(
-            "{}.assert({}, \"{}\", {{ {}: {} }});",
-            RUNTIME_IDENT, expr, msg, param_name, param_name
-        )
+        let call = self.build_assert_call(predicate, &msg, param_name, param_name);
+        Statement::new_expression_statement(SPAN, call, &self.builder)
     }
 
-    fn build_return_assert(&self, function_name: &str, predicate: &PredicateExpr) -> String {
-        let expr = self.predicate_to_js(predicate, "$");
+    fn build_return_assert(
+        &self,
+        function_name: &str,
+        predicate: &PredicateExpr,
+    ) -> Statement<'a> {
         let msg = format!(
             "{} return value violates refinement: {}",
             function_name,
             self.predicate_to_string(predicate)
         );
-        format!(
-            "{}.assert({}, \"{}\", {{ value: {} }});",
-            RUNTIME_IDENT, expr, msg, RETURN_TEMP
-        )
+        let call = self.build_assert_call(predicate, &msg, "value", RETURN_TEMP);
+        Statement::new_expression_statement(SPAN, call, &self.builder)
     }
 
-    fn build_variable_assert(&self, name: &str, predicate: &PredicateExpr, value_name: &str) -> String {
+    fn build_variable_assert(
+        &self,
+        name: &str,
+        predicate: &PredicateExpr,
+        value_name: &str,
+    ) -> Statement<'a> {
         let renamed = rename_identifier(predicate, name, value_name);
-        let expr = self.predicate_to_js(&renamed, value_name);
         let msg = format!(
             "variable '{}' violates refinement: {}",
             name,
             self.predicate_to_string(predicate)
         );
-        format!(
-            "{}.assert({}, \"{}\", {{ value: {} }});",
-            RUNTIME_IDENT, expr, msg, value_name
-        )
+        let call = self.build_assert_call(&renamed, &msg, "value", value_name);
+        Statement::new_expression_statement(SPAN, call, &self.builder)
     }
 
-    fn process_function(&mut self, func: &Function<'s>) {
+    fn process_function_body(&self, func: &Function) -> ArenaVec<'a, Statement<'a>> {
         let name = Self::function_name(func);
         let anns = match self.by_function.get(&name) {
             Some(a) => a.clone(),
-            None => return,
+            None => return ArenaVec::new_in(&self.builder),
         };
 
-        // Param assertions at body start.
-        if let Some(body) = &func.body {
-            let body_start = body.span.start as usize + 1; // after '{'
-            let mut asserts: Vec<String> = Vec::new();
-            for a in &anns {
-                if let AnnotationTarget::Param { param_name, index, .. } = &a.target {
-                    if let Some(pred) = &a.ty.predicate {
-                        if let Some(param) = func.params.items.get(*index) {
-                            if Self::param_name(param).as_deref() == Some(param_name) {
-                                asserts.push(self.build_param_assert(&name, param_name, pred));
-                            }
+        let mut asserts = ArenaVec::new_in(&self.builder);
+        for a in &anns {
+            if let AnnotationTarget::Param { param_name, index, .. } = &a.target {
+                if let Some(pred) = &a.ty.predicate {
+                    if let Some(param) = func.params.items.get(*index) {
+                        if Self::param_name(param).as_deref() == Some(param_name) {
+                            asserts.push(self.build_param_assert(&name, param_name, pred));
                         }
                     }
                 }
             }
-            if !asserts.is_empty() {
-                let text = format!("\n  {}\n", asserts.join("\n  "));
-                self.replacements.push(Replacement {
-                    start: body_start,
-                    end: body_start,
-                    text,
-                });
-            }
         }
-
-        // Enter function scope for return wrapping.
-        self.current_function.push(name.clone());
-
-        if let Some(body) = &func.body {
-            for stmt in &body.statements {
-                self.visit_statement(stmt);
-            }
-        }
-
-        self.current_function.pop();
+        asserts
     }
 
-    fn process_return(&mut self, ret: &ReturnStatement) {
+    fn return_predicates(&self, function_name: &str) -> Vec<&'a PredicateExpr> {
+        self.by_function
+            .get(function_name)
+            .map(|anns| {
+                anns.iter()
+                    .filter_map(|a| match &a.target {
+                        AnnotationTarget::Return { .. } => a.ty.predicate.as_ref(),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn build_return_iife(
+        &self,
+        function_name: &str,
+        predicates: Vec<&PredicateExpr>,
+        arg: Expression<'a>,
+    ) -> Expression<'a> {
+        // const __rt_return = arg;
+        let binding = BindingPattern::BindingIdentifier(
+            BindingIdentifier::boxed(SPAN, RETURN_TEMP, &self.builder),
+        );
+        let init_decl = VariableDeclarator::new(
+            SPAN,
+            binding,
+            None,
+            Some(arg),
+            false,
+            &self.builder,
+        );
+        let mut stmts = ArenaVec::new_in(&self.builder);
+        stmts.push(Statement::new_variable_declaration(
+            SPAN,
+            VariableDeclarationKind::Const,
+            ArenaVec::from_array_in([init_decl], &self.builder),
+            false,
+            &self.builder,
+        ));
+        for pred in predicates {
+            stmts.push(self.build_return_assert(function_name, pred));
+        }
+        stmts.push(Statement::new_return_statement(
+            SPAN,
+            Some(self.ident(RETURN_TEMP)),
+            &self.builder,
+        ));
+
+        self.wrap_in_iife(stmts)
+    }
+
+    fn build_iife_for_variable(
+        &self,
+        name: &str,
+        predicate: &PredicateExpr,
+        init: Expression<'a>,
+    ) -> Expression<'a> {
+        // const __rt_v = init;
+        let binding = BindingPattern::BindingIdentifier(
+            BindingIdentifier::boxed(SPAN, VALUE_TEMP, &self.builder),
+        );
+        let init_decl = VariableDeclarator::new(
+            SPAN,
+            binding,
+            None,
+            Some(init),
+            false,
+            &self.builder,
+        );
+        let assert_stmt = self.build_variable_assert(name, predicate, VALUE_TEMP);
+        let return_stmt = Statement::new_return_statement(
+            SPAN,
+            Some(self.ident(VALUE_TEMP)),
+            &self.builder,
+        );
+
+        let mut body_stmts = ArenaVec::new_in(&self.builder);
+        body_stmts.push(Statement::new_variable_declaration(
+            SPAN,
+            VariableDeclarationKind::Const,
+            ArenaVec::from_array_in([init_decl], &self.builder),
+            false,
+            &self.builder,
+        ));
+        body_stmts.push(assert_stmt);
+        body_stmts.push(return_stmt);
+        self.wrap_in_iife(body_stmts)
+    }
+
+    fn wrap_in_iife(&self, stmts: ArenaVec<'a, Statement<'a>>) -> Expression<'a> {
+        let body = ArrowFunctionBody::FunctionBody(FunctionBody::boxed(
+            SPAN,
+            ArenaVec::new_in(&self.builder),
+            stmts,
+            &self.builder,
+        ));
+        let params = FormalParameters::boxed(
+            SPAN,
+            FormalParameterKind::FormalParameter,
+            ArenaVec::new_in(&self.builder),
+            None,
+            &self.builder,
+        );
+        let arrow_expr = Expression::new_arrow_function_expression(
+            SPAN,
+            false,
+            None,
+            params,
+            None,
+            body,
+            &self.builder,
+        );
+        Expression::new_call_expression(
+            SPAN,
+            arrow_expr,
+            None,
+            ArenaVec::new_in(&self.builder),
+            false,
+            &self.builder,
+        )
+    }
+}
+
+impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
+    fn visit_function(&mut self, func: &mut Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        let name = Self::function_name(func);
+        let has_function_annotations = self.by_function.contains_key(&name);
+
+        if has_function_annotations {
+            self.current_function.push(name.clone());
+
+            let asserts = self.process_function_body(func);
+            if !asserts.is_empty() {
+                if let Some(body) = &mut func.body {
+                    let mut new_statements = ArenaVec::new_in(&self.builder);
+                    new_statements.extend(asserts);
+                    new_statements.extend(body.statements.drain(..));
+                    body.statements = new_statements;
+                }
+            }
+        }
+
+        oxc_ast_visit::walk_mut::walk_function(self, func, _flags);
+
+        if has_function_annotations {
+            self.current_function.pop();
+        }
+    }
+
+    fn visit_return_statement(&mut self, ret: &mut ReturnStatement<'a>) {
         let function_name = match self.current_function.last() {
             Some(n) => n.clone(),
             None => return,
         };
 
-        let anns = match self.by_function.get(&function_name) {
-            Some(a) => a.clone(),
-            None => return,
-        };
-
-        let return_predicates: Vec<&PredicateExpr> = anns
-            .iter()
-            .filter_map(|a| match &a.target {
-                AnnotationTarget::Return { .. } => a.ty.predicate.as_ref(),
-                _ => None,
-            })
-            .collect();
-
-        if return_predicates.is_empty() {
+        let predicates = self.return_predicates(&function_name);
+        if predicates.is_empty() {
             return;
         }
 
-        let arg = match &ret.argument {
+        let arg = match ret.argument.take() {
             Some(arg) => arg,
             None => return,
         };
 
-        // Skip if this return already returns our temp.
-        if let Some(name) = expression_identifier(arg) {
-            if name == RETURN_TEMP {
+        // Skip if already returning our temp.
+        if let Expression::Identifier(id) = &arg {
+            if id.name == RETURN_TEMP {
+                ret.argument = Some(arg);
                 return;
             }
         }
 
-        let arg_text = self.source_text(arg.span());
-        let asserts = return_predicates
-            .iter()
-            .map(|p| self.build_return_assert(&function_name, p))
-            .collect::<Vec<_>>()
-            .join("\n  ");
-
-        let replacement = format!(
-            "{{\n  const {} = {};\n  {}\n  return {};\n}}",
-            RETURN_TEMP, arg_text, asserts, RETURN_TEMP
-        );
-
-        self.replacements.push(Replacement {
-            start: ret.span.start as usize,
-            end: ret.span.end as usize,
-            text: replacement,
-        });
+        ret.argument = Some(self.build_return_iife(&function_name, predicates, arg));
     }
 
-    fn process_variable_declaration(&mut self, decl: &VariableDeclaration) {
-        for d in &decl.declarations {
+    fn visit_variable_declaration(&mut self, decl: &mut VariableDeclaration<'a>) {
+        for d in &mut decl.declarations {
             let name = match &d.id {
                 BindingPattern::BindingIdentifier(id) => id.name.to_string(),
                 _ => continue,
@@ -339,83 +505,35 @@ impl<'s> TranspileCollector<'s> {
             };
             let predicate = anns.iter().find_map(|a| a.ty.predicate.as_ref());
             let Some(predicate) = predicate else { continue };
-            let Some(init) = &d.init else { continue };
+            let Some(init) = d.init.take() else { continue };
 
-            let init_text = self.source_text(init.span());
-            let assert_text = self.build_variable_assert(&name, predicate, VALUE_TEMP);
-            let replacement = format!(
-                "{} = (() => {{\n  const {} = {};\n  {}\n  return {};\n}})()",
-                name, VALUE_TEMP, init_text, assert_text, VALUE_TEMP
-            );
-
-            // Replace from start of declarator id to end of init.
-            let start = d.id.span().start as usize;
-            let end = init.span().end as usize;
-            self.replacements.push(Replacement {
-                start,
-                end,
-                text: replacement,
-            });
+            d.init = Some(self.build_iife_for_variable(&name, predicate, init));
         }
     }
 }
 
 fn rename_identifier(pred: &PredicateExpr, from: &str, to: &str) -> PredicateExpr {
     match pred {
-        PredicateExpr::Identifier(name) => {
-            PredicateExpr::Identifier(if name == from { to.to_string() } else { name.clone() })
-        }
-        PredicateExpr::Member(obj, prop) => {
-            PredicateExpr::Member(if obj == from { to.to_string() } else { obj.clone() }, prop.clone())
-        }
+        PredicateExpr::Identifier(name) => PredicateExpr::Identifier(
+            if name == from { to.to_string() } else { name.clone() },
+        ),
+        PredicateExpr::Member(obj, prop) => PredicateExpr::Member(
+            if obj == from { to.to_string() } else { obj.clone() },
+            prop.clone(),
+        ),
         PredicateExpr::Not(expr) => {
             PredicateExpr::Not(Box::new(rename_identifier(expr, from, to)))
         }
-        PredicateExpr::Logical(op, left, right) => {
-            PredicateExpr::Logical(op.clone(), Box::new(rename_identifier(left, from, to)), Box::new(rename_identifier(right, from, to)))
-        }
-        PredicateExpr::Binary(op, left, right) => {
-            PredicateExpr::Binary(op.clone(), Box::new(rename_identifier(left, from, to)), Box::new(rename_identifier(right, from, to)))
-        }
+        PredicateExpr::Logical(op, left, right) => PredicateExpr::Logical(
+            op.clone(),
+            Box::new(rename_identifier(left, from, to)),
+            Box::new(rename_identifier(right, from, to)),
+        ),
+        PredicateExpr::Binary(op, left, right) => PredicateExpr::Binary(
+            op.clone(),
+            Box::new(rename_identifier(left, from, to)),
+            Box::new(rename_identifier(right, from, to)),
+        ),
         other => other.clone(),
-    }
-}
-
-fn expression_identifier<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
-    match expr {
-        Expression::Identifier(id) => Some(id.name.as_str()),
-        _ => None,
-    }
-}
-
-impl<'s> Visit<'s> for TranspileCollector<'s> {
-    fn visit_program(&mut self, program: &Program<'s>) {
-        for stmt in &program.body {
-            self.visit_statement(stmt);
-        }
-    }
-
-    fn visit_statement(&mut self, stmt: &Statement<'s>) {
-        match stmt {
-            Statement::FunctionDeclaration(func) => {
-                self.process_function(func);
-            }
-            Statement::VariableDeclaration(decl) => {
-                self.process_variable_declaration(decl);
-                for d in &decl.declarations {
-                    if let Some(init) = &d.init {
-                        self.visit_expression(init);
-                    }
-                }
-            }
-            _ => oxc_ast_visit::walk::walk_statement(self, stmt),
-        }
-    }
-
-    fn visit_return_statement(&mut self, ret: &ReturnStatement<'s>) {
-        self.process_return(ret);
-        if let Some(arg) = &ret.argument {
-            self.visit_expression(arg);
-        }
     }
 }
