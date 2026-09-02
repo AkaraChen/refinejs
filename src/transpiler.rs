@@ -2,15 +2,15 @@ use crate::syntax::*;
 use oxc_allocator::{Allocator, ArenaVec};
 use oxc_ast::ast::*;
 use oxc_ast::builder::AstBuilder;
-use oxc_ast_visit::VisitMut;
+use oxc_ast_visit::{Visit, VisitMut};
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
-use oxc_span::{SourceType, SPAN};
+use oxc_span::{SPAN, SourceType};
 use std::collections::HashMap;
 
 const RUNTIME_IDENT: &str = "__rt";
-const RETURN_TEMP: &str = "__rt_return";
-const VALUE_TEMP: &str = "__rt_v";
+const RETURN_TEMP_BASE: &str = "__rt_return";
+const VALUE_TEMP_BASE: &str = "__rt_v";
 
 pub fn transpile(source: &str, annotations: &[Annotation]) -> Result<String, String> {
     let allocator = Allocator::default();
@@ -23,7 +23,10 @@ pub fn transpile(source: &str, annotations: &[Annotation]) -> Result<String, Str
         return Err(format!("Parse errors: {:?}", ret.diagnostics));
     }
 
-    let mut visitor = TranspilerVisitor::new(&allocator, annotations);
+    let mut identifier_collector = IdentifierCollector::default();
+    identifier_collector.visit_program(&ret.program);
+    let mut visitor =
+        TranspilerVisitor::new(&allocator, annotations, &identifier_collector.identifiers);
     visitor.visit_program(&mut ret.program);
 
     let code = Codegen::new().build(&ret.program).code;
@@ -33,23 +36,45 @@ pub fn transpile(source: &str, annotations: &[Annotation]) -> Result<String, Str
 struct TranspilerVisitor<'a> {
     allocator: &'a Allocator,
     builder: AstBuilder<'a>,
-    by_function: HashMap<String, Vec<&'a Annotation>>,
-    by_variable: HashMap<String, Vec<&'a Annotation>>,
-    current_function: Vec<String>,
+    by_function: HashMap<(String, u32), Vec<&'a Annotation>>,
+    by_variable: HashMap<(String, u32), Vec<&'a Annotation>>,
+    current_function: Vec<(String, u32)>,
+    return_temp: String,
+    value_temp: String,
 }
 
 impl<'a> TranspilerVisitor<'a> {
-    fn new(allocator: &'a Allocator, annotations: &'a [Annotation]) -> Self {
-        let mut by_function: HashMap<String, Vec<&Annotation>> = HashMap::new();
-        let mut by_variable: HashMap<String, Vec<&Annotation>> = HashMap::new();
+    fn new(
+        allocator: &'a Allocator,
+        annotations: &'a [Annotation],
+        identifiers: &std::collections::HashSet<String>,
+    ) -> Self {
+        let mut by_function: HashMap<(String, u32), Vec<&Annotation>> = HashMap::new();
+        let mut by_variable: HashMap<(String, u32), Vec<&Annotation>> = HashMap::new();
         for a in annotations {
             match &a.target {
-                AnnotationTarget::Param { function_name, .. }
-                | AnnotationTarget::Return { function_name } => {
-                    by_function.entry(function_name.clone()).or_default().push(a);
+                AnnotationTarget::Param {
+                    function_name,
+                    function_start,
+                    ..
                 }
-                AnnotationTarget::Variable { name } => {
-                    by_variable.entry(name.clone()).or_default().push(a);
+                | AnnotationTarget::Return {
+                    function_name,
+                    function_start,
+                } => {
+                    by_function
+                        .entry((function_name.clone(), *function_start))
+                        .or_default()
+                        .push(a);
+                }
+                AnnotationTarget::Variable {
+                    name,
+                    declaration_start,
+                } => {
+                    by_variable
+                        .entry((name.clone(), *declaration_start))
+                        .or_default()
+                        .push(a);
                 }
             }
         }
@@ -59,6 +84,8 @@ impl<'a> TranspilerVisitor<'a> {
             by_function,
             by_variable,
             current_function: Vec::new(),
+            return_temp: fresh_generated_identifier(identifiers, RETURN_TEMP_BASE),
+            value_temp: fresh_generated_identifier(identifiers, VALUE_TEMP_BASE),
         }
     }
 
@@ -95,7 +122,13 @@ impl<'a> TranspilerVisitor<'a> {
     }
 
     fn numeric_literal(&self, value: f64) -> Expression<'a> {
-        Expression::new_numeric_literal(SPAN, value, None::<Str>, NumberBase::Decimal, &self.builder)
+        Expression::new_numeric_literal(
+            SPAN,
+            value,
+            None::<Str>,
+            NumberBase::Decimal,
+            &self.builder,
+        )
     }
 
     fn boolean_literal(&self, value: bool) -> Expression<'a> {
@@ -118,10 +151,18 @@ impl<'a> TranspilerVisitor<'a> {
             },
             PredicateExpr::Identifier(name) => self.ident(name),
             PredicateExpr::Member(obj, prop) => self.member_expr(obj, prop),
-            PredicateExpr::Return => self.ident(RETURN_TEMP),
+            // Predicate parameters are compile-time abstractions. Concrete
+            // refinements at call sites are still checked statically.
+            PredicateExpr::PredicateApply(_, _) => self.boolean_literal(true),
+            PredicateExpr::Return => self.ident(&self.return_temp),
             PredicateExpr::Not(expr) => {
                 let arg = self.predicate_to_expr(expr, self_name);
-                Expression::new_unary_expression(SPAN, UnaryOperator::LogicalNot, arg, &self.builder)
+                Expression::new_unary_expression(
+                    SPAN,
+                    UnaryOperator::LogicalNot,
+                    arg,
+                    &self.builder,
+                )
             }
             PredicateExpr::Logical(op, left, right) => {
                 let op = match op {
@@ -163,6 +204,9 @@ impl<'a> TranspilerVisitor<'a> {
             },
             PredicateExpr::Identifier(name) => name.clone(),
             PredicateExpr::Member(obj, prop) => format!("{}.{}", obj, prop),
+            PredicateExpr::PredicateApply(name, expr) => {
+                format!("{}({})", name, self.predicate_to_string(expr))
+            }
             PredicateExpr::Return => "$".to_string(),
             PredicateExpr::Not(expr) => format!("!({})", self.predicate_to_string(expr)),
             PredicateExpr::Logical(op, left, right) => {
@@ -214,11 +258,8 @@ impl<'a> TranspilerVisitor<'a> {
         let cond = self.predicate_to_expr(predicate, ctx_value_name);
         let msg = self.string_literal(message);
 
-        let ctx_key_ident = PropertyKey::StaticIdentifier(IdentifierName::boxed(
-            SPAN,
-            ctx_key,
-            &self.builder,
-        ));
+        let ctx_key_ident =
+            PropertyKey::StaticIdentifier(IdentifierName::boxed(SPAN, ctx_key, &self.builder));
         let ctx_value = self.ident(ctx_value_name);
         let prop = ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
             SPAN,
@@ -264,17 +305,13 @@ impl<'a> TranspilerVisitor<'a> {
         Statement::new_expression_statement(SPAN, call, &self.builder)
     }
 
-    fn build_return_assert(
-        &self,
-        function_name: &str,
-        predicate: &PredicateExpr,
-    ) -> Statement<'a> {
+    fn build_return_assert(&self, function_name: &str, predicate: &PredicateExpr) -> Statement<'a> {
         let msg = format!(
             "{} return value violates refinement: {}",
             function_name,
             self.predicate_to_string(predicate)
         );
-        let call = self.build_assert_call(predicate, &msg, "value", RETURN_TEMP);
+        let call = self.build_assert_call(predicate, &msg, "value", &self.return_temp);
         Statement::new_expression_statement(SPAN, call, &self.builder)
     }
 
@@ -296,14 +333,18 @@ impl<'a> TranspilerVisitor<'a> {
 
     fn process_function_body(&self, func: &Function) -> ArenaVec<'a, Statement<'a>> {
         let name = Self::function_name(func);
-        let anns = match self.by_function.get(&name) {
+        let key = (name.clone(), func.span.start);
+        let anns = match self.by_function.get(&key) {
             Some(a) => a.clone(),
             None => return ArenaVec::new_in(&self.builder),
         };
 
         let mut asserts = ArenaVec::new_in(&self.builder);
         for a in &anns {
-            if let AnnotationTarget::Param { param_name, index, .. } = &a.target {
+            if let AnnotationTarget::Param {
+                param_name, index, ..
+            } = &a.target
+            {
                 if let Some(pred) = &a.ty.predicate {
                     if let Some(param) = func.params.items.get(*index) {
                         if Self::param_name(param).as_deref() == Some(param_name) {
@@ -316,9 +357,9 @@ impl<'a> TranspilerVisitor<'a> {
         asserts
     }
 
-    fn return_predicates(&self, function_name: &str) -> Vec<&'a PredicateExpr> {
+    fn return_predicates(&self, function: &(String, u32)) -> Vec<&'a PredicateExpr> {
         self.by_function
-            .get(function_name)
+            .get(function)
             .map(|anns| {
                 anns.iter()
                     .filter_map(|a| match &a.target {
@@ -337,17 +378,13 @@ impl<'a> TranspilerVisitor<'a> {
         arg: Expression<'a>,
     ) -> Expression<'a> {
         // const __rt_return = arg;
-        let binding = BindingPattern::BindingIdentifier(
-            BindingIdentifier::boxed(SPAN, RETURN_TEMP, &self.builder),
-        );
-        let init_decl = VariableDeclarator::new(
+        let binding = BindingPattern::BindingIdentifier(BindingIdentifier::boxed(
             SPAN,
-            binding,
-            None,
-            Some(arg),
-            false,
+            self.alloc_str(&self.return_temp),
             &self.builder,
-        );
+        ));
+        let init_decl =
+            VariableDeclarator::new(SPAN, binding, None, Some(arg), false, &self.builder);
         let mut stmts = ArenaVec::new_in(&self.builder);
         stmts.push(Statement::new_variable_declaration(
             SPAN,
@@ -361,7 +398,7 @@ impl<'a> TranspilerVisitor<'a> {
         }
         stmts.push(Statement::new_return_statement(
             SPAN,
-            Some(self.ident(RETURN_TEMP)),
+            Some(self.ident(&self.return_temp)),
             &self.builder,
         ));
 
@@ -375,21 +412,17 @@ impl<'a> TranspilerVisitor<'a> {
         init: Expression<'a>,
     ) -> Expression<'a> {
         // const __rt_v = init;
-        let binding = BindingPattern::BindingIdentifier(
-            BindingIdentifier::boxed(SPAN, VALUE_TEMP, &self.builder),
-        );
-        let init_decl = VariableDeclarator::new(
+        let binding = BindingPattern::BindingIdentifier(BindingIdentifier::boxed(
             SPAN,
-            binding,
-            None,
-            Some(init),
-            false,
+            self.alloc_str(&self.value_temp),
             &self.builder,
-        );
-        let assert_stmt = self.build_variable_assert(name, predicate, VALUE_TEMP);
+        ));
+        let init_decl =
+            VariableDeclarator::new(SPAN, binding, None, Some(init), false, &self.builder);
+        let assert_stmt = self.build_variable_assert(name, predicate, &self.value_temp);
         let return_stmt = Statement::new_return_statement(
             SPAN,
-            Some(self.ident(VALUE_TEMP)),
+            Some(self.ident(&self.value_temp)),
             &self.builder,
         );
 
@@ -443,10 +476,11 @@ impl<'a> TranspilerVisitor<'a> {
 impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
     fn visit_function(&mut self, func: &mut Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
         let name = Self::function_name(func);
-        let has_function_annotations = self.by_function.contains_key(&name);
+        let key = (name, func.span.start);
+        let has_function_annotations = self.by_function.contains_key(&key);
 
         if has_function_annotations {
-            self.current_function.push(name.clone());
+            self.current_function.push(key.clone());
 
             let asserts = self.process_function_body(func);
             if !asserts.is_empty() {
@@ -467,12 +501,12 @@ impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
     }
 
     fn visit_return_statement(&mut self, ret: &mut ReturnStatement<'a>) {
-        let function_name = match self.current_function.last() {
+        let function = match self.current_function.last() {
             Some(n) => n.clone(),
             None => return,
         };
 
-        let predicates = self.return_predicates(&function_name);
+        let predicates = self.return_predicates(&function);
         if predicates.is_empty() {
             return;
         }
@@ -482,15 +516,7 @@ impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
             None => return,
         };
 
-        // Skip if already returning our temp.
-        if let Expression::Identifier(id) = &arg {
-            if id.name == RETURN_TEMP {
-                ret.argument = Some(arg);
-                return;
-            }
-        }
-
-        ret.argument = Some(self.build_return_iife(&function_name, predicates, arg));
+        ret.argument = Some(self.build_return_iife(&function.0, predicates, arg));
     }
 
     fn visit_variable_declaration(&mut self, decl: &mut VariableDeclaration<'a>) {
@@ -499,7 +525,7 @@ impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
                 BindingPattern::BindingIdentifier(id) => id.name.to_string(),
                 _ => continue,
             };
-            let anns = match self.by_variable.get(&name) {
+            let anns = match self.by_variable.get(&(name.clone(), d.span.start)) {
                 Some(a) => a.clone(),
                 None => continue,
             };
@@ -512,18 +538,53 @@ impl<'a> VisitMut<'a> for TranspilerVisitor<'a> {
     }
 }
 
+#[derive(Default)]
+struct IdentifierCollector {
+    identifiers: std::collections::HashSet<String>,
+}
+
+impl<'a> Visit<'a> for IdentifierCollector {
+    fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        self.identifiers.insert(identifier.name.to_string());
+    }
+
+    fn visit_binding_identifier(&mut self, identifier: &BindingIdentifier<'a>) {
+        self.identifiers.insert(identifier.name.to_string());
+    }
+}
+
+fn fresh_generated_identifier(
+    identifiers: &std::collections::HashSet<String>,
+    base: &str,
+) -> String {
+    let mut candidate = base.to_string();
+    let mut suffix = 0usize;
+    while identifiers.contains(&candidate) {
+        suffix += 1;
+        candidate = format!("{base}_{suffix}");
+    }
+    candidate
+}
+
 fn rename_identifier(pred: &PredicateExpr, from: &str, to: &str) -> PredicateExpr {
     match pred {
-        PredicateExpr::Identifier(name) => PredicateExpr::Identifier(
-            if name == from { to.to_string() } else { name.clone() },
-        ),
+        PredicateExpr::Identifier(name) => PredicateExpr::Identifier(if name == from {
+            to.to_string()
+        } else {
+            name.clone()
+        }),
         PredicateExpr::Member(obj, prop) => PredicateExpr::Member(
-            if obj == from { to.to_string() } else { obj.clone() },
+            if obj == from {
+                to.to_string()
+            } else {
+                obj.clone()
+            },
             prop.clone(),
         ),
-        PredicateExpr::Not(expr) => {
-            PredicateExpr::Not(Box::new(rename_identifier(expr, from, to)))
+        PredicateExpr::PredicateApply(name, expr) => {
+            PredicateExpr::PredicateApply(name.clone(), Box::new(rename_identifier(expr, from, to)))
         }
+        PredicateExpr::Not(expr) => PredicateExpr::Not(Box::new(rename_identifier(expr, from, to))),
         PredicateExpr::Logical(op, left, right) => PredicateExpr::Logical(
             op.clone(),
             Box::new(rename_identifier(left, from, to)),

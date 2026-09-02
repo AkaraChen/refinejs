@@ -23,13 +23,20 @@ fn run_check(input_path: &str) -> bool {
 
     prelude::merge_prelude(&mut result.annotations);
 
-    let errors = checker::check_annotations(&result.annotations);
+    let errors = checker::check_source(&source, input_path, &result.annotations);
     if !errors.is_empty() {
         for e in errors {
             let loc = e
                 .loc
                 .as_ref()
-                .map(|l| format!("{}:{}:{}: ", l.file.as_deref().unwrap_or(""), l.line, l.column))
+                .map(|l| {
+                    format!(
+                        "{}:{}:{}: ",
+                        l.file.as_deref().unwrap_or(""),
+                        l.line,
+                        l.column
+                    )
+                })
                 .unwrap_or_default();
             eprintln!("{}{}", loc, e.message);
         }
@@ -59,13 +66,20 @@ fn run_build(input_path: &str, output_path: &str) -> bool {
 
     prelude::merge_prelude(&mut result.annotations);
 
-    let errors = checker::check_annotations(&result.annotations);
+    let errors = checker::check_source(&source, input_path, &result.annotations);
     if !errors.is_empty() {
         for e in errors {
             let loc = e
                 .loc
                 .as_ref()
-                .map(|l| format!("{}:{}:{}: ", l.file.as_deref().unwrap_or(""), l.line, l.column))
+                .map(|l| {
+                    format!(
+                        "{}:{}:{}: ",
+                        l.file.as_deref().unwrap_or(""),
+                        l.line,
+                        l.column
+                    )
+                })
                 .unwrap_or_default();
             eprintln!("{}{}", loc, e.message);
         }

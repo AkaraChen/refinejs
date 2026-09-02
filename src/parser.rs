@@ -17,7 +17,6 @@ enum TokenKind {
     Arrow,
     LParen,
     RParen,
-    LAngle,
     LBrace,
     RBrace,
     Comma,
@@ -63,7 +62,9 @@ impl<'a> Lexer<'a> {
             if ch.is_whitespace() {
                 self.pos += ch.len_utf8();
             } else if ch == '/' && self.src[self.pos + 1..].starts_with('/') {
-                while self.pos < self.src.len() && self.src[self.pos..].chars().next().unwrap() != '\n' {
+                while self.pos < self.src.len()
+                    && self.src[self.pos..].chars().next().unwrap() != '\n'
+                {
                     self.pos += 1;
                 }
             } else {
@@ -84,7 +85,14 @@ impl<'a> Lexer<'a> {
             return Ok(Some(self.read_string(ch)?));
         }
 
-        if ch.is_ascii_digit() || (ch == '.' && self.src[start + 1..].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)) {
+        if ch.is_ascii_digit()
+            || (ch == '.'
+                && self.src[start + 1..]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false))
+        {
             return Ok(Some(self.read_number()));
         }
 
@@ -95,33 +103,156 @@ impl<'a> Lexer<'a> {
         let two = &self.src[start..self.src.len().min(start + 2)];
         let three = &self.src[start..self.src.len().min(start + 3)];
 
-        if three == "===" { self.pos += 3; return Ok(Some(Token { kind: TokenKind::Op, value: "===".into(), _pos: start })); }
-        if three == "!==" { self.pos += 3; return Ok(Some(Token { kind: TokenKind::Op, value: "!==".into(), _pos: start })); }
-        if two == "==" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Op, value: "==".into(), _pos: start })); }
-        if two == "!=" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Op, value: "!=".into(), _pos: start })); }
-        if two == ">=" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Op, value: ">=".into(), _pos: start })); }
-        if two == "<=" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Op, value: "<=".into(), _pos: start })); }
-        if two == "&&" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Op, value: "&&".into(), _pos: start })); }
-        if two == "||" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Op, value: "||".into(), _pos: start })); }
-        if two == "=>" { self.pos += 2; return Ok(Some(Token { kind: TokenKind::Arrow, value: "=>".into(), _pos: start })); }
+        if three == "===" {
+            self.pos += 3;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "===".into(),
+                _pos: start,
+            }));
+        }
+        if three == "!==" {
+            self.pos += 3;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "!==".into(),
+                _pos: start,
+            }));
+        }
+        if two == "==" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "==".into(),
+                _pos: start,
+            }));
+        }
+        if two == "!=" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "!=".into(),
+                _pos: start,
+            }));
+        }
+        if two == ">=" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ">=".into(),
+                _pos: start,
+            }));
+        }
+        if two == "<=" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "<=".into(),
+                _pos: start,
+            }));
+        }
+        if two == "&&" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "&&".into(),
+                _pos: start,
+            }));
+        }
+        if two == "||" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: "||".into(),
+                _pos: start,
+            }));
+        }
+        if two == "=>" {
+            self.pos += 2;
+            return Ok(Some(Token {
+                kind: TokenKind::Arrow,
+                value: "=>".into(),
+                _pos: start,
+            }));
+        }
 
         self.pos += 1;
         match ch {
-            ':' => Ok(Some(Token { kind: TokenKind::Colon, value: ch.to_string(), _pos: start })),
-            '|' => Ok(Some(Token { kind: TokenKind::Pipe, value: ch.to_string(), _pos: start })),
-            '(' => Ok(Some(Token { kind: TokenKind::LParen, value: ch.to_string(), _pos: start })),
-            ')' => Ok(Some(Token { kind: TokenKind::RParen, value: ch.to_string(), _pos: start })),
-            '<' => Ok(Some(Token { kind: TokenKind::LAngle, value: ch.to_string(), _pos: start })),
-            '>' => Ok(Some(Token { kind: TokenKind::Op, value: ch.to_string(), _pos: start })),
-            '{' => Ok(Some(Token { kind: TokenKind::LBrace, value: ch.to_string(), _pos: start })),
-            '}' => Ok(Some(Token { kind: TokenKind::RBrace, value: ch.to_string(), _pos: start })),
-            ',' => Ok(Some(Token { kind: TokenKind::Comma, value: ch.to_string(), _pos: start })),
-            '.' => Ok(Some(Token { kind: TokenKind::Dot, value: ch.to_string(), _pos: start })),
-            '!' => Ok(Some(Token { kind: TokenKind::Op, value: ch.to_string(), _pos: start })),
-            '+' => Ok(Some(Token { kind: TokenKind::Op, value: ch.to_string(), _pos: start })),
-            '-' => Ok(Some(Token { kind: TokenKind::Op, value: ch.to_string(), _pos: start })),
-            '*' => Ok(Some(Token { kind: TokenKind::Op, value: ch.to_string(), _pos: start })),
-            '/' => Ok(Some(Token { kind: TokenKind::Op, value: ch.to_string(), _pos: start })),
+            ':' => Ok(Some(Token {
+                kind: TokenKind::Colon,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '|' => Ok(Some(Token {
+                kind: TokenKind::Pipe,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '(' => Ok(Some(Token {
+                kind: TokenKind::LParen,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            ')' => Ok(Some(Token {
+                kind: TokenKind::RParen,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '<' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '>' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '{' => Ok(Some(Token {
+                kind: TokenKind::LBrace,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '}' => Ok(Some(Token {
+                kind: TokenKind::RBrace,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            ',' => Ok(Some(Token {
+                kind: TokenKind::Comma,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '.' => Ok(Some(Token {
+                kind: TokenKind::Dot,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '!' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '+' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '-' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '*' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
+            '/' => Ok(Some(Token {
+                kind: TokenKind::Op,
+                value: ch.to_string(),
+                _pos: start,
+            })),
             _ => Err(format!("Unexpected character '{}' at {}", ch, start)),
         }
     }
@@ -134,7 +265,11 @@ impl<'a> Lexer<'a> {
             let ch = self.src[self.pos..].chars().next().unwrap();
             if ch == quote {
                 self.pos += 1;
-                return Ok(Token { kind: TokenKind::String, value, _pos: start });
+                return Ok(Token {
+                    kind: TokenKind::String,
+                    value,
+                    _pos: start,
+                });
             }
             if ch == '\\' {
                 self.pos += 1;
@@ -155,7 +290,11 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Token { kind: TokenKind::Number, value: self.src[start..self.pos].into(), _pos: start }
+        Token {
+            kind: TokenKind::Number,
+            value: self.src[start..self.pos].into(),
+            _pos: start,
+        }
     }
 
     fn read_ident(&mut self) -> Token {
@@ -168,26 +307,49 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Token { kind: TokenKind::Ident, value: self.src[start..self.pos].into(), _pos: start }
+        Token {
+            kind: TokenKind::Ident,
+            value: self.src[start..self.pos].into(),
+            _pos: start,
+        }
     }
 }
 
 struct TypeParser {
     tokens: Vec<Token>,
     pos: usize,
+    predicate_params: Vec<String>,
 }
 
 impl TypeParser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            predicate_params: Vec::new(),
+        }
     }
 
     fn parse_annotation(&mut self) -> Result<RefinementType, String> {
         self.expect_ident("type")?;
         self.expect(TokenKind::Colon)?;
+        if self.peek().kind == TokenKind::Ident && self.peek().value == "forall" {
+            self.pos += 1;
+            loop {
+                let name = self.expect_ident_raw()?;
+                self.predicate_params.push(name);
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Dot)?;
+        }
         let ty = self.parse_refined_type()?;
         if !self.peek().is_eof() {
-            return Err(format!("Unexpected token '{}' after type", self.peek().value));
+            return Err(format!(
+                "Unexpected token '{}' after type",
+                self.peek().value
+            ));
         }
         Ok(ty)
     }
@@ -197,9 +359,15 @@ impl TypeParser {
         if self.peek().kind == TokenKind::Pipe {
             self.pos += 1;
             let predicate = self.parse_predicate()?;
-            Ok(RefinementType { base, predicate: Some(predicate) })
+            Ok(RefinementType {
+                base,
+                predicate: Some(predicate),
+            })
         } else {
-            Ok(RefinementType { base, predicate: None })
+            Ok(RefinementType {
+                base,
+                predicate: None,
+            })
         }
     }
 
@@ -211,9 +379,11 @@ impl TypeParser {
                 let name = self.peek().value.clone();
                 self.pos += 1;
                 match name.as_str() {
-                    "number" | "string" | "boolean" | "unknown" | "any" | "void" => Ok(BaseType::Primitive(name)),
+                    "number" | "string" | "boolean" | "unknown" | "any" | "void" => {
+                        Ok(BaseType::Primitive(name))
+                    }
                     "Array" => {
-                        self.expect(TokenKind::LAngle)?;
+                        self.expect_op("<")?;
                         let el = self.parse_base_type()?;
                         self.expect_op(">")?;
                         Ok(BaseType::Array(Box::new(el)))
@@ -234,7 +404,9 @@ impl TypeParser {
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_refined_type()?;
                 params.push(RefinedParam { name, ty });
-                if !self.eat(TokenKind::Comma) { break; }
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RParen)?;
@@ -252,7 +424,9 @@ impl TypeParser {
                 self.expect(TokenKind::Colon)?;
                 let ty = self.parse_base_type()?;
                 fields.push((name, ty));
-                if !self.eat(TokenKind::Comma) { break; }
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RBrace)?;
@@ -326,7 +500,11 @@ impl TypeParser {
             if op == BinaryOp::Add || op == BinaryOp::Sub {
                 self.pos += 1;
                 let expr = self.parse_unary()?;
-                return Ok(PredicateExpr::Binary(op, Box::new(PredicateExpr::Literal(Literal::Number(0.0))), Box::new(expr)));
+                return Ok(PredicateExpr::Binary(
+                    op,
+                    Box::new(PredicateExpr::Literal(Literal::Number(0.0))),
+                    Box::new(expr),
+                ));
             }
         }
         self.parse_primary()
@@ -337,7 +515,10 @@ impl TypeParser {
         match tok.kind {
             TokenKind::Number => {
                 self.pos += 1;
-                let v: f64 = tok.value.parse().map_err(|_| format!("Invalid number {}", tok.value))?;
+                let v: f64 = tok
+                    .value
+                    .parse()
+                    .map_err(|_| format!("Invalid number {}", tok.value))?;
                 Ok(PredicateExpr::Literal(Literal::Number(v)))
             }
             TokenKind::String => {
@@ -357,7 +538,12 @@ impl TypeParser {
                     "false" => Ok(PredicateExpr::Literal(Literal::Boolean(false))),
                     "$" => Ok(PredicateExpr::Return),
                     _ => {
-                        if self.peek().kind == TokenKind::Dot {
+                        if self.peek().kind == TokenKind::LParen {
+                            self.pos += 1;
+                            let arg = self.parse_predicate()?;
+                            self.expect(TokenKind::RParen)?;
+                            Ok(PredicateExpr::PredicateApply(tok.value, Box::new(arg)))
+                        } else if self.peek().kind == TokenKind::Dot {
                             self.pos += 1;
                             let prop = self.expect_ident_raw()?;
                             Ok(PredicateExpr::Member(tok.value, prop))
@@ -377,7 +563,11 @@ impl TypeParser {
 
     fn peek_op(&self) -> Option<&str> {
         let t = self.peek();
-        if t.kind == TokenKind::Op { Some(&t.value) } else { None }
+        if t.kind == TokenKind::Op {
+            Some(&t.value)
+        } else {
+            None
+        }
     }
 
     fn peek_comparison_op(&self) -> Option<BinaryOp> {
@@ -412,7 +602,11 @@ impl TypeParser {
 
     fn expect(&mut self, kind: TokenKind) -> Result<(), String> {
         if self.peek().kind != kind {
-            return Err(format!("Expected {:?} but got '{}'", kind, self.peek().value));
+            return Err(format!(
+                "Expected {:?} but got '{}'",
+                kind,
+                self.peek().value
+            ));
         }
         self.pos += 1;
         Ok(())
@@ -420,7 +614,11 @@ impl TypeParser {
 
     fn expect_op(&mut self, value: &str) -> Result<(), String> {
         if self.peek().kind != TokenKind::Op || self.peek().value != value {
-            return Err(format!("Expected operator '{}' but got '{}'", value, self.peek().value));
+            return Err(format!(
+                "Expected operator '{}' but got '{}'",
+                value,
+                self.peek().value
+            ));
         }
         self.pos += 1;
         Ok(())
@@ -428,7 +626,11 @@ impl TypeParser {
 
     fn expect_ident(&mut self, value: &str) -> Result<(), String> {
         if self.peek().kind != TokenKind::Ident || self.peek().value != value {
-            return Err(format!("Expected '{}' but got '{}'", value, self.peek().value));
+            return Err(format!(
+                "Expected '{}' but got '{}'",
+                value,
+                self.peek().value
+            ));
         }
         self.pos += 1;
         Ok(())
@@ -436,7 +638,10 @@ impl TypeParser {
 
     fn expect_ident_raw(&mut self) -> Result<String, String> {
         if self.peek().kind != TokenKind::Ident {
-            return Err(format!("Expected identifier but got '{}'", self.peek().value));
+            return Err(format!(
+                "Expected identifier but got '{}'",
+                self.peek().value
+            ));
         }
         let v = self.peek().value.clone();
         self.pos += 1;
@@ -466,6 +671,13 @@ pub fn parse_refinement_type(text: &str) -> Result<RefinementType, String> {
     parser.parse_annotation()
 }
 
+fn parse_annotation_payload(text: &str) -> Result<(RefinementType, Vec<String>), String> {
+    let tokens = Lexer::new(text).tokenize()?;
+    let mut parser = TypeParser::new(tokens);
+    let ty = parser.parse_annotation()?;
+    Ok((ty, parser.predicate_params))
+}
+
 fn clean_comment(text: &str) -> String {
     let trimmed = text.trim();
     let body = if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
@@ -477,7 +689,11 @@ fn clean_comment(text: &str) -> String {
         .map(|line| {
             let trimmed = line.trim_start();
             if trimmed.starts_with('*') {
-                trimmed.trim_start_matches('*').trim_start_matches(' ').trim().to_string()
+                trimmed
+                    .trim_start_matches('*')
+                    .trim_start_matches(' ')
+                    .trim()
+                    .to_string()
             } else {
                 trimmed.to_string()
             }
@@ -545,50 +761,77 @@ pub fn parse_file(source: &str, file_name: &str) -> Result<ParseResult, String> 
             column,
         };
 
-        let ty = parse_refinement_type(&payload)?;
+        let (ty, predicate_params) = parse_annotation_payload(&payload)?;
         if let Some(target) = &info.target {
             match target {
-                NodeTarget::Return { function_name } => {
+                NodeTarget::Return {
+                    function_name,
+                    function_start,
+                } => {
                     if let BaseType::Function(params, ret) = &ty.base {
                         for (idx, p) in params.iter().enumerate() {
                             annotations.push(Annotation {
                                 target: AnnotationTarget::Param {
                                     function_name: function_name.clone(),
+                                    function_start: *function_start,
                                     param_name: p.name.clone(),
                                     index: idx,
                                 },
                                 ty: p.ty.clone(),
+                                predicate_params: predicate_params.clone(),
                                 loc: loc.clone(),
                             });
                         }
                         annotations.push(Annotation {
-                            target: AnnotationTarget::Return { function_name: function_name.clone() },
+                            target: AnnotationTarget::Return {
+                                function_name: function_name.clone(),
+                                function_start: *function_start,
+                            },
                             ty: *ret.clone(),
+                            predicate_params: predicate_params.clone(),
                             loc,
                         });
                     } else {
                         annotations.push(Annotation {
-                            target: AnnotationTarget::Return { function_name: function_name.clone() },
+                            target: AnnotationTarget::Return {
+                                function_name: function_name.clone(),
+                                function_start: *function_start,
+                            },
                             ty,
+                            predicate_params: predicate_params.clone(),
                             loc,
                         });
                     }
                 }
-                NodeTarget::Param { function_name, param_name, index } => {
+                NodeTarget::Param {
+                    function_name,
+                    function_start,
+                    param_name,
+                    index,
+                } => {
                     annotations.push(Annotation {
                         target: AnnotationTarget::Param {
                             function_name: function_name.clone(),
+                            function_start: *function_start,
                             param_name: param_name.clone(),
                             index: *index,
                         },
                         ty,
+                        predicate_params,
                         loc,
                     });
                 }
-                NodeTarget::Variable { name } => {
+                NodeTarget::Variable {
+                    name,
+                    declaration_start,
+                } => {
                     annotations.push(Annotation {
-                        target: AnnotationTarget::Variable { name: name.clone() },
+                        target: AnnotationTarget::Variable {
+                            name: name.clone(),
+                            declaration_start: *declaration_start,
+                        },
                         ty,
+                        predicate_params,
                         loc,
                     });
                 }
@@ -601,9 +844,20 @@ pub fn parse_file(source: &str, file_name: &str) -> Result<ParseResult, String> 
 
 #[derive(Debug, Clone)]
 enum NodeTarget {
-    Return { function_name: String },
-    Param { function_name: String, param_name: String, index: usize },
-    Variable { name: String },
+    Return {
+        function_name: String,
+        function_start: u32,
+    },
+    Param {
+        function_name: String,
+        function_start: u32,
+        param_name: String,
+        index: usize,
+    },
+    Variable {
+        name: String,
+        declaration_start: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -653,8 +907,18 @@ impl<'a> Visit<'a> for SpanCollector {
     fn visit_statement(&mut self, stmt: &Statement<'a>) {
         match stmt {
             Statement::FunctionDeclaration(func) => {
-                let name = func.id.as_ref().map(|id| id.name.to_string()).unwrap_or_else(|| "<anonymous>".into());
-                self.add(func.span, Some(NodeTarget::Return { function_name: name.clone() }));
+                let name = func
+                    .id
+                    .as_ref()
+                    .map(|id| id.name.to_string())
+                    .unwrap_or_else(|| "<anonymous>".into());
+                self.add(
+                    func.span,
+                    Some(NodeTarget::Return {
+                        function_name: name.clone(),
+                        function_start: func.span.start,
+                    }),
+                );
                 for (idx, param) in func.params.items.iter().enumerate() {
                     let param_name = match &param.pattern {
                         BindingPattern::BindingIdentifier(id) => id.name.to_string(),
@@ -664,7 +928,15 @@ impl<'a> Visit<'a> for SpanCollector {
                         },
                         _ => continue,
                     };
-                    self.add(param.span, Some(NodeTarget::Param { function_name: name.clone(), param_name, index: idx }));
+                    self.add(
+                        param.span,
+                        Some(NodeTarget::Param {
+                            function_name: name.clone(),
+                            function_start: func.span.start,
+                            param_name,
+                            index: idx,
+                        }),
+                    );
                 }
                 if let Some(body) = &func.body {
                     for stmt in &body.statements {
@@ -678,10 +950,19 @@ impl<'a> Visit<'a> for SpanCollector {
                         BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
                         _ => None,
                     } {
-                        let target = if let Some(Expression::FunctionExpression(_)) | Some(Expression::ArrowFunctionExpression(_)) = d.init.as_ref() {
-                            NodeTarget::Return { function_name: name.clone() }
+                        let target = if let Some(Expression::FunctionExpression(_))
+                        | Some(Expression::ArrowFunctionExpression(_)) =
+                            d.init.as_ref()
+                        {
+                            NodeTarget::Return {
+                                function_name: name.clone(),
+                                function_start: d.span.start,
+                            }
                         } else {
-                            NodeTarget::Variable { name: name.clone() }
+                            NodeTarget::Variable {
+                                name: name.clone(),
+                                declaration_start: d.span.start,
+                            }
                         };
                         self.add(d.span, Some(target));
                     }

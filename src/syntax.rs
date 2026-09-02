@@ -33,6 +33,7 @@ pub enum PredicateExpr {
     Not(Box<PredicateExpr>),
     Identifier(String),
     Member(String, String),
+    PredicateApply(String, Box<PredicateExpr>),
     Literal(Literal),
     Return,
 }
@@ -70,14 +71,17 @@ pub enum Literal {
 pub enum AnnotationTarget {
     Param {
         function_name: String,
+        function_start: u32,
         param_name: String,
         index: usize,
     },
     Return {
         function_name: String,
+        function_start: u32,
     },
     Variable {
         name: String,
+        declaration_start: u32,
     },
 }
 
@@ -85,6 +89,7 @@ pub enum AnnotationTarget {
 pub struct Annotation {
     pub target: AnnotationTarget,
     pub ty: RefinementType,
+    pub predicate_params: Vec<String>,
     pub loc: SourceLocation,
 }
 

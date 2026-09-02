@@ -4,3 +4,4 @@ pub mod prelude;
 pub mod runtime;
 pub mod syntax;
 pub mod transpiler;
+pub mod verifier;

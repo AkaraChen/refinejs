@@ -1,14 +1,33 @@
 use crate::syntax::*;
 use std::collections::HashSet;
 
+pub fn check_source(source: &str, file_name: &str, annotations: &[Annotation]) -> Vec<RtError> {
+    let mut errors = check_annotations(annotations);
+    if errors.is_empty() {
+        errors.extend(crate::verifier::verify_source(
+            source,
+            file_name,
+            annotations,
+        ));
+    }
+    errors
+}
+
 pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
     let mut errors = Vec::new();
 
-    let mut params_by_function: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+    let mut params_by_function: std::collections::HashMap<(String, u32), HashSet<String>> =
+        std::collections::HashMap::new();
     for a in annotations {
-        if let AnnotationTarget::Param { function_name, param_name, .. } = &a.target {
+        if let AnnotationTarget::Param {
+            function_name,
+            function_start,
+            param_name,
+            ..
+        } = &a.target
+        {
             params_by_function
-                .entry(function_name.clone())
+                .entry((function_name.clone(), *function_start))
                 .or_default()
                 .insert(param_name.clone());
         }
@@ -16,19 +35,31 @@ pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
 
     for a in annotations {
         let mut allowed = HashSet::new();
+        for name in &a.predicate_params {
+            allowed.insert(format!("@predicate:{name}"));
+        }
         let is_return = matches!(a.target, AnnotationTarget::Return { .. });
 
         match &a.target {
-            AnnotationTarget::Param { function_name, .. } => {
-                if let Some(set) = params_by_function.get(function_name) {
+            AnnotationTarget::Param {
+                function_name,
+                function_start,
+                ..
+            } => {
+                if let Some(set) = params_by_function.get(&(function_name.clone(), *function_start))
+                {
                     for p in set {
                         allowed.insert(p.clone());
                     }
                 }
                 allowed.insert("length".to_string());
             }
-            AnnotationTarget::Return { function_name } => {
-                if let Some(set) = params_by_function.get(function_name) {
+            AnnotationTarget::Return {
+                function_name,
+                function_start,
+            } => {
+                if let Some(set) = params_by_function.get(&(function_name.clone(), *function_start))
+                {
                     for p in set {
                         allowed.insert(p.clone());
                     }
@@ -36,7 +67,7 @@ pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
                 allowed.insert("$".to_string());
                 allowed.insert("length".to_string());
             }
-            AnnotationTarget::Variable { name } => {
+            AnnotationTarget::Variable { name, .. } => {
                 allowed.insert(name.clone());
                 allowed.insert("length".to_string());
             }
@@ -47,6 +78,16 @@ pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
         }
 
         if let Some(pred) = &a.ty.predicate {
+            if !matches!(
+                &a.ty.base,
+                BaseType::Primitive(name) if name == "number" || name == "boolean"
+            ) {
+                errors.push(RtError {
+                    message: "Refinement predicates require a number or boolean base type".into(),
+                    loc: Some(a.loc.clone()),
+                });
+                continue;
+            }
             if let Some(err) = check_predicate(pred, &allowed, is_return, a.loc.clone()) {
                 errors.push(err);
             }
@@ -58,10 +99,22 @@ pub fn check_annotations(annotations: &[Annotation]) -> Vec<RtError> {
 
 fn check_type(ty: &RefinementType, loc: SourceLocation) -> Option<RtError> {
     match &ty.base {
-        BaseType::Array(el) => check_type(&RefinementType { base: (**el).clone(), predicate: None }, loc),
+        BaseType::Array(el) => check_type(
+            &RefinementType {
+                base: (**el).clone(),
+                predicate: None,
+            },
+            loc,
+        ),
         BaseType::Object(fields) => {
             for (_, t) in fields {
-                if let Some(err) = check_type(&RefinementType { base: t.clone(), predicate: None }, loc.clone()) {
+                if let Some(err) = check_type(
+                    &RefinementType {
+                        base: t.clone(),
+                        predicate: None,
+                    },
+                    loc.clone(),
+                ) {
                     return Some(err);
                 }
             }
@@ -79,13 +132,19 @@ fn check_type(ty: &RefinementType, loc: SourceLocation) -> Option<RtError> {
     }
 }
 
-fn check_predicate(pred: &PredicateExpr, allowed: &HashSet<String>, is_return: bool, loc: SourceLocation) -> Option<RtError> {
+fn check_predicate(
+    pred: &PredicateExpr,
+    allowed: &HashSet<String>,
+    is_return: bool,
+    loc: SourceLocation,
+) -> Option<RtError> {
     match pred {
         PredicateExpr::Literal(_) => None,
         PredicateExpr::Identifier(name) => {
             if name == "$" && !is_return {
                 return Some(RtError {
-                    message: "Return marker '$' is only allowed in return refinement predicates".into(),
+                    message: "Return marker '$' is only allowed in return refinement predicates"
+                        .into(),
                     loc: Some(loc),
                 });
             }
@@ -106,10 +165,20 @@ fn check_predicate(pred: &PredicateExpr, allowed: &HashSet<String>, is_return: b
             }
             None
         }
+        PredicateExpr::PredicateApply(name, argument) => {
+            if !allowed.contains(&format!("@predicate:{name}")) {
+                return Some(RtError {
+                    message: format!("Unknown predicate parameter '{}'", name),
+                    loc: Some(loc),
+                });
+            }
+            check_predicate(argument, allowed, is_return, loc)
+        }
         PredicateExpr::Return => {
             if !is_return {
                 return Some(RtError {
-                    message: "Return marker '$' is only allowed in return refinement predicates".into(),
+                    message: "Return marker '$' is only allowed in return refinement predicates"
+                        .into(),
                     loc: Some(loc),
                 });
             }
