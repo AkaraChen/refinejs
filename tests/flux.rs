@@ -1,4 +1,4 @@
-use refinejs::{checker, parser, prelude, runtime, syntax::Annotation, transpiler};
+use refinejs::{checker, parser, prelude::Environment, runtime, syntax::Annotation, transpiler};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -31,21 +31,25 @@ fn flux_fixtures(suffix: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn parse_with_prelude(path: &Path) -> (String, Vec<Annotation>) {
+fn parse_fixture(path: &Path) -> (String, Vec<Annotation>) {
     let file_name = path.display().to_string();
     let source = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {file_name}: {error}"));
-    let mut parsed = parser::parse_file(&source, &file_name)
+    let parsed = parser::parse_file(&source, &file_name)
         .unwrap_or_else(|error| panic!("failed to parse {file_name}: {error}"));
-    prelude::merge_prelude(&mut parsed.annotations);
     (source, parsed.annotations)
 }
 
 fn assert_statically_valid_and_runs(path: &Path) {
     let file_name = path.display().to_string();
-    let (source, annotations) = parse_with_prelude(path);
+    let (source, annotations) = parse_fixture(path);
 
-    let errors = checker::check_source(&source, &file_name, &annotations);
+    let errors = checker::check_source_with_environment(
+        &source,
+        &file_name,
+        &annotations,
+        Environment::Auto,
+    );
     assert!(
         errors.is_empty(),
         "expected {file_name} to verify statically, got:\n{errors:#?}"
@@ -82,8 +86,13 @@ fn flux_positive_fixtures_verify_and_run_without_assertion_failures() {
 fn flux_negative_fixtures_are_rejected_statically() {
     for path in flux_fixtures("_negative.js") {
         let file_name = path.display().to_string();
-        let (source, annotations) = parse_with_prelude(&path);
-        let errors = checker::check_source(&source, &file_name, &annotations);
+        let (source, annotations) = parse_fixture(&path);
+        let errors = checker::check_source_with_environment(
+            &source,
+            &file_name,
+            &annotations,
+            Environment::Auto,
+        );
         assert!(
             !errors.is_empty(),
             "expected {file_name} to be rejected statically"
@@ -208,8 +217,13 @@ fn soundness_regressions_have_definite_diagnostics() {
     for (fixture, expected) in cases {
         let path = fixture_path(fixture);
         let file_name = path.display().to_string();
-        let (source, annotations) = parse_with_prelude(&path);
-        let errors = checker::check_source(&source, &file_name, &annotations);
+        let (source, annotations) = parse_fixture(&path);
+        let errors = checker::check_source_with_environment(
+            &source,
+            &file_name,
+            &annotations,
+            Environment::Auto,
+        );
         assert!(
             errors.iter().any(|error| error.message.contains(expected)),
             "expected {file_name} to report {expected:?}, got {errors:#?}"
@@ -257,7 +271,7 @@ fn flux_rs_triage_lists_deferred_neg_surface_twins() {
 #[test]
 fn transpiler_preserves_parameter_return_and_variable_assertions_hygienically() {
     let core_path = fixture_path("flux_core_positive.js");
-    let (core_source, core_annotations) = parse_with_prelude(&core_path);
+    let (core_source, core_annotations) = parse_fixture(&core_path);
     let core_output = transpiler::transpile(&core_source, &core_annotations).unwrap();
     assert_eq!(core_output.matches("__rt.assert").count(), 10);
     assert!(core_output.contains("parameter"));
@@ -265,14 +279,14 @@ fn transpiler_preserves_parameter_return_and_variable_assertions_hygienically() 
     assert!(core_output.contains("variable"));
 
     let hygiene_path = fixture_path("flux_hygiene_positive.js");
-    let (hygiene_source, hygiene_annotations) = parse_with_prelude(&hygiene_path);
+    let (hygiene_source, hygiene_annotations) = parse_fixture(&hygiene_path);
     let hygiene_output = transpiler::transpile(&hygiene_source, &hygiene_annotations).unwrap();
     assert_eq!(hygiene_output.matches("__rt.assert").count(), 3);
     assert!(hygiene_output.contains("__rt_return_1"));
     assert!(hygiene_output.contains("__rt_v_1"));
 
     let unicode_path = fixture_path("flux_unicode_hygiene_positive.js");
-    let (unicode_source, unicode_annotations) = parse_with_prelude(&unicode_path);
+    let (unicode_source, unicode_annotations) = parse_fixture(&unicode_path);
     let unicode_output = transpiler::transpile(&unicode_source, &unicode_annotations).unwrap();
     assert_eq!(unicode_output.matches("__rt.assert").count(), 2);
     assert!(unicode_output.contains("__rt_return_1"));

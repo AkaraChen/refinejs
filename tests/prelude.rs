@@ -1,7 +1,4 @@
-use refinejs::{
-    checker, parser,
-    prelude::{self, Environment},
-};
+use refinejs::{checker, parser, prelude::Environment};
 use std::{
     collections::BTreeSet,
     fs,
@@ -21,9 +18,8 @@ fn parse_fixture(relative: &str) -> (String, Vec<refinejs::syntax::Annotation>) 
     let file_name = path.display().to_string();
     let source = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {file_name}: {error}"));
-    let mut parsed = parser::parse_file(&source, &file_name)
+    let parsed = parser::parse_file(&source, &file_name)
         .unwrap_or_else(|error| panic!("failed to parse {file_name}: {error}"));
-    prelude::merge_prelude(&mut parsed.annotations);
     (source, parsed.annotations)
 }
 

@@ -1,6 +1,6 @@
 use refinejs::{
     checker, parser,
-    prelude::{self, Environment},
+    prelude::Environment,
     type_provider::{
         CompilerDiagnostic, CompilerDiagnosticKind, CompilerDiagnosticSeverity, CompilerRange,
         CompilerTypeAnalysis, CompilerTypeAtOffset, CompilerTypeProvider,
@@ -274,9 +274,9 @@ impl CompilerTypeProvider for NumberArrayProvider {
 }
 
 fn parsed_annotations(source: &str, file_name: &str) -> Vec<refinejs::syntax::Annotation> {
-    let mut parsed = parser::parse_file(source, file_name).expect("fixture must parse");
-    prelude::merge_prelude(&mut parsed.annotations);
-    parsed.annotations
+    parser::parse_file(source, file_name)
+        .expect("fixture must parse")
+        .annotations
 }
 
 fn source_line(source: &str, needle: &str) -> u32 {

@@ -12,7 +12,7 @@ use oxc_ast_visit::{
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
-use std::{collections::BTreeSet, error::Error, fmt, str::FromStr};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Environment {
@@ -44,41 +44,6 @@ impl fmt::Display for Environment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseEnvironmentError {
-    value: String,
-}
-
-impl fmt::Display for ParseEnvironmentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "unknown environment '{}'; expected auto, ecmascript, browser, node, deno, or bun",
-            self.value
-        )
-    }
-}
-
-impl Error for ParseEnvironmentError {}
-
-impl FromStr for Environment {
-    type Err = ParseEnvironmentError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "ecmascript" | "es" => Ok(Self::Ecmascript),
-            "browser" | "dom" => Ok(Self::Browser),
-            "node" | "nodejs" => Ok(Self::Node),
-            "deno" => Ok(Self::Deno),
-            "bun" => Ok(Self::Bun),
-            _ => Err(ParseEnvironmentError {
-                value: value.to_string(),
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EvidenceKind {
     Import,
@@ -103,7 +68,6 @@ pub struct EnvironmentEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentError {
-    AutoRequiresSource,
     Parse {
         diagnostics: Vec<String>,
     },
@@ -116,9 +80,6 @@ pub enum EnvironmentError {
 impl fmt::Display for EnvironmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AutoRequiresSource => {
-                formatter.write_str("automatic environment selection requires source text")
-            }
             Self::Parse { diagnostics } => {
                 write!(
                     formatter,
@@ -156,18 +117,6 @@ impl fmt::Display for EnvironmentError {
 }
 
 impl Error for EnvironmentError {}
-
-/// Resolve an explicit environment, or inspect source when `requested` is
-/// `Auto`. An explicit selection intentionally wins over incidental markers.
-pub fn resolve_environment(
-    requested: Environment,
-    source: &str,
-) -> Result<Environment, EnvironmentError> {
-    match requested {
-        Environment::Auto => detect_environment(source),
-        environment => Ok(environment),
-    }
-}
 
 /// Detect a single runtime using syntax-aware import and unbound-global
 /// evidence. Node compatibility markers are accepted inside Deno and Bun.
