@@ -144,14 +144,6 @@ impl CorsaTypeProvider {
         }
     }
 
-    pub fn executable(&self) -> &std::path::Path {
-        &self.executable
-    }
-
-    pub fn working_directory(&self) -> &std::path::Path {
-        &self.working_directory
-    }
-
     /// Analyze all requested positions in one Corsa project session.
     pub fn analyze(
         &self,

@@ -179,36 +179,7 @@ struct FixpointConstraint<'a> {
     consequent: &'a Term,
 }
 
-pub fn verify_source(source: &str, file_name: &str, annotations: &[Annotation]) -> Vec<RtError> {
-    verify_source_with_environment(source, file_name, annotations, Environment::Auto)
-}
-
-pub fn verify_source_with_environment(
-    source: &str,
-    file_name: &str,
-    annotations: &[Annotation],
-    environment: Environment,
-) -> Vec<RtError> {
-    verify_source_internal(source, file_name, annotations, environment, None)
-}
-
-pub fn verify_source_with_environment_and_compiler_hints(
-    source: &str,
-    file_name: &str,
-    annotations: &[Annotation],
-    environment: Environment,
-    compiler_hints: &CompilerHints,
-) -> Vec<RtError> {
-    verify_source_internal(
-        source,
-        file_name,
-        annotations,
-        environment,
-        Some(compiler_hints),
-    )
-}
-
-fn verify_source_internal<'a>(
+pub(crate) fn verify_source<'a>(
     source: &'a str,
     file_name: &'a str,
     annotations: &[Annotation],
@@ -237,17 +208,12 @@ fn verify_source_internal<'a>(
     };
     let contracts = collect_contracts(annotations);
     let annotation_errors = validate_annotation_structure(annotations, &contracts);
-    let signatures = contracts
-        .iter()
-        .filter(|(_, contract)| contract.loc.file.as_deref() == Some("<prelude>"))
-        .map(|((name, _), contract)| (name.clone(), contract.clone()))
-        .collect();
     let variable_types = collect_variable_types(annotations);
     let mut verifier = Verifier {
         source,
         file_name,
         contracts,
-        signatures,
+        signatures: HashMap::new(),
         library,
         imports: HashMap::new(),
         top_level_bindings: HashSet::new(),
@@ -848,9 +814,7 @@ impl Verifier<'_> {
             }
         }
         for ((name, declaration_start), contract) in &self.contracts {
-            if contract.loc.file.as_deref() != Some("<prelude>")
-                && !top_level_functions.contains(&(name.clone(), *declaration_start))
-            {
+            if !top_level_functions.contains(&(name.clone(), *declaration_start)) {
                 self.errors.push(RtError {
                     message: format!(
                         "Refined function '{name}' must be a top-level function declaration"

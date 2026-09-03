@@ -226,15 +226,13 @@ fn run_check(
         }
     };
 
-    let mut result = match parser::parse_file(&source, input_path) {
+    let result = match parser::parse_file(&source, input_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Parse error: {}", e);
             return false;
         }
     };
-
-    prelude::merge_prelude(&mut result.annotations);
 
     let errors = match check_with_options(
         &source,
@@ -286,15 +284,13 @@ fn run_build(
         }
     };
 
-    let mut result = match parser::parse_file(&source, input_path) {
+    let result = match parser::parse_file(&source, input_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Parse error: {}", e);
             return false;
         }
     };
-
-    prelude::merge_prelude(&mut result.annotations);
 
     let errors = match check_with_options(
         &source,

@@ -1,4 +1,4 @@
-use refinejs::{checker, parser, prelude, syntax, transpiler};
+use refinejs::{checker, parser, prelude::Environment, syntax, transpiler};
 
 const SQRT_SOURCE: &str = r#"
 /*#rt
@@ -26,18 +26,26 @@ fn parser_finds_annotations() {
 
 #[test]
 fn checker_accepts_valid() {
-    let mut result = parser::parse_file(SQRT_SOURCE, "test.js").unwrap();
-    prelude::merge_prelude(&mut result.annotations);
-    let errors = checker::check_annotations(&result.annotations);
+    let result = parser::parse_file(SQRT_SOURCE, "test.js").unwrap();
+    let errors = checker::check_source_with_environment(
+        SQRT_SOURCE,
+        "test.js",
+        &result.annotations,
+        Environment::Auto,
+    );
     assert!(errors.is_empty(), "{:?}", errors);
 }
 
 #[test]
 fn checker_rejects_unknown_identifier() {
     let source = "/*#rt type: number | y > 0 */\nconst x = 5;";
-    let mut result = parser::parse_file(source, "test.js").unwrap();
-    prelude::merge_prelude(&mut result.annotations);
-    let errors = checker::check_annotations(&result.annotations);
+    let result = parser::parse_file(source, "test.js").unwrap();
+    let errors = checker::check_source_with_environment(
+        source,
+        "test.js",
+        &result.annotations,
+        Environment::Auto,
+    );
     assert!(!errors.is_empty());
 }
 

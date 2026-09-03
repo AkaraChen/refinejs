@@ -747,13 +747,6 @@ impl Token {
     }
 }
 
-pub fn parse_refinement_type(text: &str) -> Result<RefinementType, String> {
-    let lexer = Lexer::new(text);
-    let tokens = lexer.tokenize()?;
-    let mut parser = TypeParser::new(tokens);
-    parser.parse_annotation()
-}
-
 fn parse_annotation_payload(text: &str) -> Result<(RefinementType, Vec<String>), String> {
     let tokens = Lexer::new(text).tokenize()?;
     let mut parser = TypeParser::new(tokens);

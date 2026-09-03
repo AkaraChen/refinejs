@@ -1,8 +1,8 @@
-use crate::syntax::{AnnotationTarget, BaseType, PredicateExpr};
+use crate::syntax::{BaseType, PredicateExpr};
 
 use super::{
     CallbackTiming, Environment, EnvironmentError, LibraryExport, ReceiverEffect,
-    SemanticRefinement, detect_environment, merge_prelude, registry, registry_for_source,
+    SemanticRefinement, catalog, detect_environment, registry_for_source,
 };
 
 #[test]
@@ -71,18 +71,14 @@ fn incompatible_runtime_markers_report_deterministic_evidence() {
 }
 
 #[test]
-fn explicit_environment_wins_and_auto_requires_source() {
-    assert!(matches!(
-        registry(Environment::Auto),
-        Err(EnvironmentError::AutoRequiresSource)
-    ));
+fn explicit_environment_wins_over_source_markers() {
     let selected = registry_for_source(Environment::Node, "Deno.cwd();").unwrap();
     assert_eq!(selected.environment(), Environment::Node);
 }
 
 #[test]
 fn ecmascript_catalog_exposes_generic_array_contracts_and_refinements() {
-    let catalog = registry(Environment::Ecmascript).unwrap();
+    let catalog = catalog::build(Environment::Ecmascript);
     let map = &catalog.receiver_method("Array", "map").unwrap()[0];
     assert_eq!(map.type_parameters, ["$T", "$U"]);
     assert_eq!(map.effects.receiver, ReceiverEffect::Read);
@@ -124,11 +120,17 @@ fn ecmascript_catalog_exposes_generic_array_contracts_and_refinements() {
             narrowed_to: BaseType::Array(_),
         }]
     ));
+    for path in ["Math.sqrt", "Math.abs", "Array.isArray", "Number.isInteger"] {
+        assert!(
+            catalog.static_function(path).is_some(),
+            "catalog must expose {path} without annotation injection"
+        );
+    }
 }
 
 #[test]
 fn runtime_catalogs_are_isolated_and_modules_support_aliases_and_overloads() {
-    let browser = registry(Environment::Browser).unwrap();
+    let browser = catalog::build(Environment::Browser);
     assert!(browser.global("document").is_some());
     assert!(
         browser
@@ -158,7 +160,7 @@ fn runtime_catalogs_are_isolated_and_modules_support_aliases_and_overloads() {
         BaseType::Primitive("boolean".into())
     );
 
-    let node = registry(Environment::Node).unwrap();
+    let node = catalog::build(Environment::Node);
     assert!(node.global("process").is_some());
     assert!(node.global("document").is_none());
     let canonical = node.module_export("node:fs", "readFileSync").unwrap();
@@ -170,7 +172,7 @@ fn runtime_catalogs_are_isolated_and_modules_support_aliases_and_overloads() {
         Some(LibraryExport::Function(overloads)) if overloads.len() == 2
     ));
 
-    let deno = registry(Environment::Deno).unwrap();
+    let deno = catalog::build(Environment::Deno);
     assert!(deno.global("Deno").is_some());
     assert!(deno.static_function("Deno.readTextFile").is_some());
     assert!(deno.module_export("node:path", "join").is_some());
@@ -179,7 +181,7 @@ fn runtime_catalogs_are_isolated_and_modules_support_aliases_and_overloads() {
     assert!(deno.static_function("setTimeout").is_some());
     assert!(deno.static_function("clearTimeout").is_some());
 
-    let bun = registry(Environment::Bun).unwrap();
+    let bun = catalog::build(Environment::Bun);
     assert!(bun.global("Bun").is_some());
     assert!(bun.global("process").is_some());
     assert!(bun.static_function("Bun.serve").is_some());
@@ -202,32 +204,9 @@ fn runtime_catalogs_are_isolated_and_modules_support_aliases_and_overloads() {
 
 #[test]
 fn catalog_iteration_is_lexically_deterministic() {
-    let catalog = registry(Environment::Bun).unwrap();
+    let catalog = catalog::build(Environment::Bun);
     let globals: Vec<_> = catalog.globals().map(|(name, _)| name).collect();
     assert!(globals.windows(2).all(|pair| pair[0] < pair[1]));
     let modules: Vec<_> = catalog.modules().map(|(name, _)| name).collect();
     assert!(modules.windows(2).all(|pair| pair[0] < pair[1]));
-}
-
-#[test]
-fn legacy_merge_keeps_original_four_static_contracts() {
-    let mut annotations = Vec::new();
-    merge_prelude(&mut annotations);
-    assert_eq!(annotations.len(), 8);
-    let returns: Vec<_> = annotations
-        .iter()
-        .filter_map(|annotation| match &annotation.target {
-            AnnotationTarget::Return { function_name, .. } => Some(function_name.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        returns,
-        ["Math.sqrt", "Math.abs", "Array.isArray", "Number.isInteger"]
-    );
-    assert!(annotations.iter().all(|annotation| {
-        annotation.loc.file.as_deref() == Some("<prelude>")
-            && annotation.loc.line == 0
-            && annotation.loc.column == 0
-    }));
 }
