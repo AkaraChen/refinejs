@@ -1,5 +1,25 @@
 # refinejs
 
+> **This repository is no longer developed. Do not open new work here.**
+>
+> The original crate mixed oxc parsing, `/*#rt */` comments, the prelude, the
+> CLI, the playground, Z3 Horn solving, `__rt.assert` emission, and
+> Corsa-backed library types into one tree. That stack was not a reusable
+> foundation: there was no checker-agnostic layer to hang a second analysis
+> on. Porting Austral-style ownership / borrow checking into this repo would
+> have meant extracting a platform that never existed as a boundary.
+>
+> Development continues in **[pragmajs](https://github.com/AkaraChen/pragmajs)**
+> (`crates/rt`, crate `pragma-rt`). That repo is the monorepo for both checkers
+> (ownership / borrow as `pragma-own`, this refinement-type checker as
+> `pragma-rt`). This tree stays as a historical snapshot.
+>
+> 本仓库已停止开发，请不要在这里开新工作。
+> 原因：解析、注释、prelude、CLI、playground 和 Z3 / 运行时断言 / Corsa
+> 缠在同一个 crate 里，没有可复用的检查器基建。所有权 / 借用检查没法干净地
+> 接进来。后续在 [pragmajs](https://github.com/AkaraChen/pragmajs)
+> 的 `crates/rt`（crate `pragma-rt`）继续。下面是停更前的说明。
+
 Flux-style refinement types for JavaScript. `refinejs check` statically proves
 liquid-type obligations with Z3; `refinejs build` additionally preserves the
 existing `__rt.assert` runtime checks in the emitted JavaScript.
