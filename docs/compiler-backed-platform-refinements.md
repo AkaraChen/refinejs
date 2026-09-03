@@ -83,9 +83,8 @@ The catalog models more than function signatures. Each entry can describe:
 - receiver containment introduced by mutating calls such as `Array.prototype.push`.
 
 Catalogs and diagnostics use deterministic ordered collections so repeated
-runs have stable behavior and output. The existing `prelude::merge_prelude`
-entry point remains available for compatibility while the implementation is
-organized into catalog and legacy modules.
+runs have stable behavior and output. The verifier looks up catalog entries
+directly; it does not inject prelude signatures into user annotations.
 
 ### Corsa integration
 
